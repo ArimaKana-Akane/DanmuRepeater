@@ -1,5 +1,5 @@
 [README.md](https://github.com/user-attachments/files/30871903/README.md)
-# 🤖 烂梗机 (Làng Gěng Jī)
+# 🤖 烂梗机 
 
 > 多平台直播弹幕自动复读助手 · Tampermonkey 用户脚本
 
