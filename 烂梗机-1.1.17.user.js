@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         烂梗机
 // @namespace    http://tampermonkey.net/
-// @version      1.1.10
+// @version      1.1.17
 // @description  多平台自动复读弹幕 | 智能去重 | 候选实时刷新(限50) | 模块化重构
 // @match        https://www.douyu.com/*
 // @match        https://www.huya.com/*
@@ -19,17 +19,116 @@
 // 1.1.10 修复：DPM 批量节点漏计（批量容器内每条弹幕各计一次）；
 //             候选词限定最高 50 条并实时刷新（UI 间隔 2s→1s）；
 //             修复开关重开后 observer 不恢复
+// 1.1.11 修复：频次统计改为滑动时间窗口（2 分钟）——旧弹幕不再霸榜，
+//             候选词跟随当前直播话题实时更新，杜绝发送过期弹幕
+// 1.1.12 修复：调度器单链守卫——runBot 异步执行期间 mainTimer 为空，
+//             UI 循环每秒调用 switchMode 会误判无调度而重复启动调度链，
+//             导致双链并存一次发送两条弹幕；新增 schedulerBusy 标志彻底防重入
+// 1.1.13 优化：面板拖拽渲染性能——transform: translate3d 替代 left/top
+//             （不再每帧强制重排）；requestAnimationFrame 合并高频 move 事件；
+//             Pointer Events + setPointerCapture 替代 document 级监听，
+//             拖动更跟手流畅
+// 1.1.14 修复：多实例并发发送——实测 Tampermonkey 沙箱隔离导致
+//             window 防重标记失效，脚本在主文档与同源 iframe 各注入 2 次，
+//             多实例各自调度发送（"一次发两条"的又一来源）。
+//             新增 @noframes + iframe 排除 + document 属性防重（跨沙箱可靠）
+// 1.1.15 修复（真实浏览器端到端实测驱动）：
+//             P0 B 站回归——1.1.14 的 @noframes+iframe 排除误杀 B 站：
+//             B 站弹幕渲染在同源 iframe（live.bilibili.com/blanc/...）内，
+//             脚本在 iframe 退出、主文档又无弹幕 DOM → B 站完全无法采集。
+//             改为平台感知帧选择：仅允许 blanc iframe 运行，B 站主文档退出；
+//             P0 调度链竞态残余——stopBot 强制 schedulerBusy=false 时旧 runBot
+//             仍在飞行，快速关→开会清掉新链标志重复 setTimeout，新增 epoch 令牌；
+//             P0 send() 局部 input 在 refreshCache 成功后未重读（_fillInput(null)
+//             必抛 FILL_ERROR）；
+//             P1 容器轮询失效——findContainer 降级 body 导致轮询 1 秒即停
+//             （实测斗鱼/抖音均降级 body），改为找不到返回 null、超时才降级；
+//             P1 发送后校验加宽限（平台清空输入框有延迟，误判会 3 秒后重发同一条）；
+//             P1 正则屏蔽词被 / 分隔符拆成普通词（设置页永远无法录入正则）；
+//             P1 设置页错误日志区打开时不渲染；
+//             P1 去重窗口/历史条数设 0 时语义反转（0=关闭去重）；
+//             B 站弹幕文本选择器修正（避免回退 textContent 带上用户名）
+// 1.1.16 修复（生产环境实测驱动）：
+//             P0 B 站双渲染模式——1.1.15 的"B 站主文档一律退出"误杀主文档直挂
+//             弹幕的房间（实测 6343442：#chat-items 在主文档，无 blanc iframe），
+//             而 856077/814 是 blanc iframe 模式。帧选择修正为：
+//             iframe 仅放行 blanc；B 站主文档仅在页面存在 blanc iframe 时让位；
+//             轮询循环二次检查兜底 blanc 晚插入场景
+// 1.1.17 修复（静态审查清单驱动）：
+//             P1 系统弹幕（欢迎语/公告）不再入候选（实测斗鱼"欢迎来到..."被采集）；
+//             P1 斗鱼受控 contenteditable 输入同步——补发 InputEvent(inputType=insertText,
+//                data)，通用发送补 Enter 兜底（实测按钮 is-gray 不激活的根因）；
+//             P1 多版本共存告警——data-lgj-loaded 记录版本号，检测到旧版已运行
+//                时 console 警告（升级前必须删除旧版脚本，否则双实例并发发送）；
+//             P1 SEND_FAILED（输入框未清空）不再自动重试——可能实际已发出，
+//                 重发只会造成重复弹幕，仅"明确未发出"的错误才重试；
+//             N 让位净化——B 类房间主文档让位时移除 idle 面板、断开 observer、
+//                 周期任务空转（standDown 标志）；
+//             N 让位检查提前到 body 降级之前（blanc 晚于 45s 出现时不再失效）；
+//             L 选择器失配不再静默失效（批量分支空结果回退按节点文本兜底）；
+//             L getSelectors 返回完整选择器数组（多候选不再只有 [0] 生效）；
+//             L 设置页空输入保存不再覆盖为 0（保持原值）；
+//             L 补 normalIntervalMin/Max 设置项；input min=0 属性不再丢失；
+//             L Logger 默认静音 debug 级（洪峰降噪）；面板位置视口 clamp；
+//             L 倒计时定时器复用（不再每秒重建）；预览与实发一致；
+//             L escapeHtml 转义引号；清理死代码（clearRegexCache、
+//                MAX_HISTORY_SIZE_FALLBACK）
 
 (function () {
     'use strict';
 
+    // ============================================================
+    // 防重复加载（跨沙箱可靠版）
+    // 问题：Tampermonkey 沙箱模式下 window/document 与页面隔离，
+    //       window.dyBotScriptLoaded 防重标记可能失效 → 脚本重复执行
+    //       （实测主文档 + 同源 iframe 各注入多次 → 多实例并发发送）。
+    // 修复：
+    //   1) iframe 内直接退出（@noframes 兜底 + 代码级双保险）
+    //   2) 用 document 元素属性做防重标记——同一沙箱内可靠
+    // ============================================================
+    // 平台感知帧选择（1.1.16 修正，替代 1.1.15 的"B 站主文档一律退出"）：
+    // 实测发现 B 站存在两种渲染模式：
+    //   A) 弹幕直挂主文档（如房间 6343442：#chat-items 在主文档）
+    //   B) 弹幕在同源 iframe live.bilibili.com/blanc/<room> 内（如 856077/814）
+    // 1.1.15 的"主文档一律退出"会误杀 A 类房间 → 修正为：
+    //   - iframe：仅 blanc 弹幕渲染 iframe 允许运行，其余（含跨域）退出
+    //   - B 站主文档：仅当页面存在 blanc iframe（B 类房间）时让位给 iframe 实例；
+    //     A 类房间主文档正常运行。blanc iframe 晚于主文档插入的间隙由
+    //     startContainerPolling 中的二次检查兜底（见容器轮询）。
+    // - 其他平台的 iframe 一律退出（保留 1.1.14 防多实例语义）
+    const IS_TOP_FRAME = (window.top === window.self);
+    const IS_BLANC_FRAME = location.hostname.includes('bilibili.com')
+        && location.pathname.startsWith('/blanc/');
+    if (!IS_TOP_FRAME && !IS_BLANC_FRAME) {
+        return; // 非 blanc 的 iframe（含跨域）退出
+    }
+    if (IS_TOP_FRAME && location.hostname.includes('bilibili.com')
+        && document.querySelector('iframe[src*="/blanc/"]')) {
+        return; // B 类房间（blanc 模式）：主文档让位给 iframe 实例
+    }
+    // 防重标记带版本号：检测到其他版本已运行（多版本共存）时醒目告警。
+    // 注意：1.1.12 及更早版本不设置此标记，无法拦截，升级前务必删除旧版脚本，
+    // 否则同页面多实例并发发送（README/发布说明中需强调）。
+    const INSTALLED_VERSION = '1.1.17';
+    if (document.documentElement) {
+        const marker = document.documentElement.getAttribute('data-lgj-loaded');
+        if (marker) {
+            if (marker !== INSTALLED_VERSION) {
+                console.warn(`[烂梗机] 检测到已运行 v${marker}，多版本共存可能重复发送，请删除旧版脚本（当前 v${INSTALLED_VERSION}）`);
+            }
+            return;
+        }
+        try { document.documentElement.setAttribute('data-lgj-loaded', INSTALLED_VERSION); } catch (_) { /* 忽略 */ }
+    }
+    // 兼容旧标记（部分环境沙箱 window 可写回页面）
     if (window.dyBotScriptLoaded) return;
-    window.dyBotScriptLoaded = true;
+    try { window.dyBotScriptLoaded = true; } catch (_) { /* 忽略 */ }
 
     // =========================================================================
     // 模块 1：常量与平台检测
     // =========================================================================
-    const SCRIPT_VERSION = '1.1.10';
+    // 与顶层 INSTALLED_VERSION 保持同值（防重标记版本号）
+    const SCRIPT_VERSION = INSTALLED_VERSION;
 
     const PLATFORM = detectPlatform();
 
@@ -42,13 +141,13 @@
         MAX_TIMESTAMPS: 500,
         MAX_TS_AGE_MS: 120000,
         TS_CLEANUP_INTERVAL: 5000,
-        MAX_HISTORY_SIZE_FALLBACK: 100,
         RETRY_MAX_ATTEMPTS: 3,
         MIN_SEND_INTERVAL_MS: 2000,
         RETRY_DELAY_MS: 3000,
         SELECTOR_REPROBE_INTERVAL: 300000,
         CANDIDATE_REFRESH_INTERVAL: 10000,  // 候选强制刷新周期
         MAX_CANDIDATES: 50,              // 候选词数量上限（实时刷新但限制数量）
+        FREQ_WINDOW_MS: 120000,          // 频次统计窗口（2 分钟）：只统计窗口内的出现次数
     };
 
     const STORAGE_KEYS = {
@@ -106,7 +205,7 @@
     const Logger = {
         _logs: [],
         _maxLogs: 500,
-        _debug: true,
+        _debug: false,   // 默认静音 debug 级（[捕获]/[权重更新] 等洪峰噪音），info/warn/error 不受影响
 
         setDebug(on) { this._debug = !!on; },
 
@@ -171,7 +270,7 @@
     function $(id) { return document.getElementById(id); }
 
     function escapeHtml(str) {
-        return String(str).replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m] || m));
+        return String(str).replace(/[&<>'"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[m] || m));
     }
 
     function truncate(text, maxLen) {
@@ -181,6 +280,16 @@
     /** 规范化文本：去数字、标点、符号（用于智能去重合并） */
     function normalizeText(text) {
         return text.replace(/[\d\p{P}\p{S}]/gu, '').trim();
+    }
+
+    /**
+     * 系统弹幕过滤（1.1.17）：欢迎语/公告/提示类弹幕不入候选。
+     * 实测斗鱼把"欢迎来到yyfyyf的直播间。斗鱼严..."渲染为普通弹幕条目被采集。
+     * 各平台系统消息文本特征不一，此处用启发式前缀/关键词匹配，命中即丢弃。
+     */
+    function isSystemDanmaku(text) {
+        return /^(欢迎来到|系统消息|温馨提示|欢迎.{0,12}进入直播间)/.test(text)
+            || /(温馨提示|系统公告|直播间提示|本直播间)/.test(text);
     }
 
     // =========================================================================
@@ -258,7 +367,10 @@
         bilibili: {
             danmuContainer: ['#chat-items', '#chat-history-list', '.chat-list', '.danmaku-list'],
             danmuItem: ['.chat-item.danmaku-item', '.danmaku-item', '[class*="danmaku-item"]'],
-            danmuText: ['.chat-item.danmaku-item', '.danmaku-text'],
+            // 修复：'.chat-item.danmaku-item' 是条目自身，queryFirst 只查后代永远
+            //      匹配不到 → data-danmaku 缺失时会回退到整条 textContent（含用户名）
+            //      污染候选。'.danmaku-text' 前置为真正的文本节点选择器。
+            danmuText: ['.danmaku-text', '.chat-item.danmaku-item'],
             chatInput: ['textarea.chat-input', 'textarea#chat-input', 'input[type="text"].chat-input'],
             sendButton: ['button.send-btn', '.bl-button.send-btn', 'button[class*="send"]'],
             textSource: 'data-danmaku',
@@ -324,10 +436,11 @@
             const cache = this.probeAll();
             return {
                 danmuContainer: cache.danmuContainer ? cache.danmuContainerSelector : null,
-                danmuItem: this.selectors.danmuItem[0] || '',
-                danmuText: this.selectors.danmuText[0] || '',
-                chatInput: this.selectors.chatInput[0] || '',
-                sendButton: this.selectors.sendButton[0] || '',
+                // 修复：返回完整选择器数组（多候选不再只取 [0]，queryFirst/queryAll 支持数组）
+                danmuItem: this.selectors.danmuItem || [],
+                danmuText: this.selectors.danmuText || [],
+                chatInput: this.selectors.chatInput || [],
+                sendButton: this.selectors.sendButton || [],
                 containerElement: cache.danmuContainer,
             };
         }
@@ -371,6 +484,14 @@
             return (danmuNode.textContent || '').replace(/\s+/g, ' ').trim();
         }
 
+        /**
+         * 查找弹幕容器。
+         * 修复：找不到时返回 null（而非降级 document.body）——旧实现让
+         *      startContainerPolling 首次轮询（1 秒）就"成功"停止，
+         *      CONTAINER_POLL_MAX=45 的轮询机制形同虚设，容器晚于 1 秒渲染时
+         *      observer 永久绑在 body 上（实测斗鱼/抖音均触发降级）。
+         *      body 降级只应在轮询超时后由 startContainerPolling 决定。
+         */
         findContainer() {
             const sel = this.selectors;
             if (sel.containerElement && document.contains(sel.containerElement)) {
@@ -382,8 +503,7 @@
                 this.selectors.danmuContainer = result.selector;
                 return result.element;
             }
-            Logger.warn('烂梗机', '未找到弹幕容器，降级监听 body');
-            return document.body;
+            return null;
         }
 
         findChatInput() {
@@ -394,8 +514,7 @@
             return queryFirst(this.selectors.sendButton) || querySmart(this.selectors.sendButton, document, 'button');
         }
 
-        getDanmuItemSelector() { return this.selectors.danmuItem; }
-    }
+        getDanmuItemSelector() { return this.selectors.danmuItem; }    }
 
     // =========================================================================
     // 模块 9：平台发送器
@@ -426,12 +545,16 @@
             if (!state.isRunning) return { success: false, errorCode: 'STOPPED', message: '机器人已停止' };
 
             this._ensureCacheFresh();
-            const input = this.cachedInput;
+            let input = this.cachedInput;
             let button = this.cachedButton;
 
             if (!input) {
                 this.refreshCache();
-                if (!this.cachedInput) return { success: false, errorCode: 'INPUT_NOT_FOUND', message: '输入框未找到' };
+                // 修复：refreshCache 成功后必须重读缓存——旧代码继续用 null 的
+                // 局部 input 调 _fillInput 必抛 TypeError，首发必失败靠重试兜底
+                input = this.cachedInput;
+                button = this.cachedButton;
+                if (!input) return { success: false, errorCode: 'INPUT_NOT_FOUND', message: '输入框未找到' };
             }
 
             try {
@@ -444,8 +567,15 @@
             const result = await this._sendByPlatform(input, button);
             if (!result.success) return result;
 
-            // 发送后校验输入框是否清空
-            const remaining = this._getInputValue(input).trim();
+            // 发送后校验输入框是否清空。
+            // 修复：平台清空输入框有 100-300ms 延迟（B 站 Enter 发送尤甚），
+            //      立即校验会误判 SEND_FAILED → 3 秒后重发同一条 → 弹幕重复。
+            //      改为宽限轮询：最多 3 次 × 250ms 确认清空。
+            let remaining = this._getInputValue(input).trim();
+            for (let i = 0; remaining !== '' && i < 3; i++) {
+                await sleep(250);
+                remaining = this._getInputValue(input).trim();
+            }
             return remaining === ''
                 ? { success: true, errorCode: null, message: '发送成功' }
                 : { success: false, errorCode: 'SEND_FAILED', message: '发送后输入框未清空' };
@@ -488,6 +618,14 @@
 
             input.dispatchEvent(new Event('input', { bubbles: true }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
+            // 修复：斗鱼等受控 contenteditable（React/slate）只响应带 data 的
+            //      InputEvent——实测仅派发 Event('input') 时发送按钮保持灰色未激活。
+            //      补发 InputEvent(inputType=insertText, data=msg) 让框架状态同步。
+            try {
+                input.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, data: msg, inputType: 'insertText', isComposing: false,
+                }));
+            } catch (_) { /* 忽略 */ }
             try {
                 input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
                 input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: msg }));
@@ -545,6 +683,9 @@
 
             this._enableButton(btn);
             this._clickElement(btn);
+            // 修复：按钮点击可能因框架状态未同步而无响应（实测斗鱼 is-gray 灰态），
+            //      补 Enter 作为发送兜底（多数平台 Enter 与按钮等效）
+            this._pressEnter(input);
             return { success: true };
         }
 
@@ -607,6 +748,9 @@
             // 定时器
             mainTimer: null,
             countdownTimer: null,
+            schedulerBusy: false,   // 单链守卫：runBot 异步执行期间禁止重复启动调度链
+            epoch: 0,               // 调度代际令牌：stopBot 时 +1，旧链回调凭此自毁
+            standDown: false,       // B 类房间主文档让位标志：让位后本实例空转（无面板/无采集）
             nextSendTimestamp: 0,
             // 运行状态
             currentMode: MODE.OFF,
@@ -624,6 +768,7 @@
             pendingMsg: null,
             retryCount: 0,
             lastRetryTime: 0,
+            lastErrorCode: null,    // 最近一次发送失败的错误码（SEND_FAILED 不重试）
             isSending: false,
             // 屏蔽 / 优先词
             blocklist: [],
@@ -659,8 +804,6 @@
             return null;
         }
     }
-
-    function clearRegexCache() { regexCache.clear(); }
 
     /** 判断文本是否为「/xxx/」形式的正则 */
     function isRegexPattern(str) {
@@ -774,49 +917,40 @@
         const handleNode = (node) => {
             if (node.nodeType !== Node.ELEMENT_NODE) return false;
 
-            const itemSelector = parser.getDanmuItemSelector();
-            const selectors = itemSelector ? itemSelector.split(',').map(s => s.trim()).filter(Boolean) : [];
+            const selectors = parser.getDanmuItemSelector() || [];
+            // 单条弹幕处理：提取 → 系统弹幕过滤 → 入池
+            const captureOne = (el, tag) => {
+                const text = parser.extractText(el);
+                if (!text) return false;
+                if (isSystemDanmaku(text)) {
+                    Logger.debug('过滤', `系统弹幕: "${text.slice(0, 40)}"`);
+                    return false;
+                }
+                Logger.debug(tag, `"${text}"`);
+                addDanmuToCache(text);
+                recordMessageTimestamp();
+                return true;
+            };
 
             // 1) 节点自身即弹幕条目（如斗鱼 li.Barrage-listItem）→ 按单条弹幕处理
             const isDanmuItem = selectors.some(sel => {
                 try { return node.matches && node.matches(sel); } catch (_) { return false; }
             });
-            if (isDanmuItem) {
-                const text = parser.extractText(node);
-                if (text) {
-                    Logger.debug('捕获', `"${text}"`);
-                    addDanmuToCache(text);
-                    recordMessageTimestamp();
-                    return true;
-                }
-                return false;
-            }
+            if (isDanmuItem) return captureOne(node, '捕获');
 
             // 2) 批量容器节点 → 遍历所有子弹幕项，每条都计数
             if (selectors.length) {
                 const items = queryAll(selectors, node);
                 let captured = false;
                 for (const item of items) {
-                    const subText = parser.extractText(item);
-                    if (subText) {
-                        Logger.debug('捕获(子)', `"${subText}"`);
-                        addDanmuToCache(subText);
-                        recordMessageTimestamp();
-                        captured = true;
-                    }
+                    if (captureOne(item, '捕获(子)')) captured = true;
                 }
-                return captured;
+                // 修复：批量选择器失配（items 为空）时不再静默失效，落入分支 3 按文本兜底
+                if (captured) return true;
             }
 
-            // 3) 无弹幕条目选择器时的兜底：按节点文本处理
-            const text = parser.extractText(node);
-            if (text) {
-                Logger.debug('捕获', `"${text}"`);
-                addDanmuToCache(text);
-                recordMessageTimestamp();
-                return true;
-            }
-            return false;
+            // 3) 无弹幕条目选择器/批量选择器失配时的兜底：按节点文本处理
+            return captureOne(node, '捕获');
         };
 
         state.danmuObserver = new MutationObserver(mutations => {
@@ -835,12 +969,22 @@
 
     function addDanmuToCache(text) {
         if (!text) return;
-        const count = (state.freqMap.get(text) || 0) + 1;
-        state.freqMap.set(text, count);
+        const now = Date.now();
+        const existing = state.freqMap.get(text);
+
+        // 修复：滑动时间窗口统计
+        // - 若该弹幕在窗口期内再次出现 → count 递增
+        // - 若超过窗口（旧弹幕，很久没刷了）→ 重置 count=1，重新计
+        // - 杜绝「历史累计计数」导致旧弹幕权重永久霸榜、发送过期弹幕
+        if (existing && now - existing.lastSeen < TIMING.FREQ_WINDOW_MS) {
+            state.freqMap.set(text, { count: existing.count + 1, lastSeen: now });
+        } else {
+            state.freqMap.set(text, { count: 1, lastSeen: now });
+        }
 
         // 容量限制：保留频次最高的
         if (state.freqMap.size > TIMING.DANMU_CACHE_MAX) {
-            const entries = [...state.freqMap.entries()].sort((a, b) => b[1] - a[1]);
+            const entries = [...state.freqMap.entries()].sort((a, b) => b[1].count - a[1].count);
             state.freqMap = new Map(entries.slice(0, TIMING.DANMU_CACHE_MAX));
         }
 
@@ -881,17 +1025,29 @@
         const historyNorms = new Set(state.sentHistory.map(normalizeText).filter(Boolean));
 
         const newMap = new Map();
-        for (const [text, count] of state.freqMap.entries()) {
+        for (const [text, data] of state.freqMap.entries()) {
             if (text.length < state.config.minMsgLength) continue;
             if (isBlocked(text)) continue;
             const norm = normalizeText(text);
             if (recentTexts.has(text) || (norm && recentNorms.has(norm))) continue;
             if (historySet.has(text) || (norm && historyNorms.has(norm))) continue;
 
-            const weight = count * count * getLengthMultiplier(text) * getPriorityMultiplier(text);
-            newMap.set(text, { count, weight });
+            // 修复：freqMap 现在存 {count, lastSeen}
+            // - 距上次出现超过窗口的弹幕视为过期，不再进入候选
+            // - 确保发送的是「当前正在刷」的弹幕，而非很久之前的旧弹幕
+            if (now - data.lastSeen > TIMING.FREQ_WINDOW_MS) continue;
+
+            const weight = data.count * data.count * getLengthMultiplier(text) * getPriorityMultiplier(text);
+            newMap.set(text, { count: data.count, weight });
         }
         state.weightedMap = newMap;
+
+        // 清理 freqMap 中的过期条目（避免旧弹幕残留占内存）
+        for (const [text, data] of state.freqMap.entries()) {
+            if (now - data.lastSeen > TIMING.FREQ_WINDOW_MS) {
+                state.freqMap.delete(text);
+            }
+        }
         Logger.debug('权重更新', `freqMap=${state.freqMap.size} -> 候选=${newMap.size}`);
     }
 
@@ -977,11 +1133,13 @@
                 state.pendingMsg = null;
                 state.retryCount = 0;
                 state.lastRetryTime = 0;
+                state.lastErrorCode = null;
                 Logger.send(`发送成功: ${msg}`);
                 return { success: true };
             } else {
                 state.pendingMsg = msg;
                 state.lastRetryTime = Date.now();
+                state.lastErrorCode = result.errorCode || 'UNKNOWN';
                 Logger.warn('烂梗机', `发送失败: ${result.message} (${result.errorCode})`);
                 return result;
             }
@@ -989,6 +1147,7 @@
             logError('sendMessage', e);
             state.pendingMsg = msg;
             state.lastRetryTime = Date.now();
+            state.lastErrorCode = 'EXCEPTION';
             return { success: false, errorCode: 'EXCEPTION', message: e.message };
         } finally {
             state.isSending = false;
@@ -998,19 +1157,26 @@
     function updateSentHistory(msg) {
         const now = Date.now();
 
-        // 短时去重窗口
-        state.recentSent.push({ text: msg, timestamp: now });
+        // 短时去重窗口。
+        // 修复：dedupWindowSec=0 语义为「关闭窗口去重」——旧实现此时停止清理
+        //      recentSent（数组无限增长且永久参与去重），语义反转。
         const windowMs = state.config.dedupWindowSec * 1000;
         if (windowMs > 0) {
+            state.recentSent.push({ text: msg, timestamp: now });
             state.recentSent = state.recentSent.filter(m => m.timestamp > now - windowMs);
+        } else {
+            state.recentSent = [];
         }
 
-        // 历史队列
-        state.sentHistory.push(msg);
-        const maxHistory = state.config.dedupHistorySize > 0
-            ? state.config.dedupHistorySize
-            : TIMING.MAX_HISTORY_SIZE_FALLBACK;
-        while (state.sentHistory.length > maxHistory) state.sentHistory.shift();
+        // 历史队列。
+        // 修复：dedupHistorySize=0 语义为「关闭历史去重」——旧实现回退到 100 条。
+        const maxHistory = Math.max(0, state.config.dedupHistorySize || 0);
+        if (maxHistory > 0) {
+            state.sentHistory.push(msg);
+            while (state.sentHistory.length > maxHistory) state.sentHistory.shift();
+        } else {
+            state.sentHistory = [];
+        }
 
         state.lastSentMsg = msg;
         // 修复：发送后清空候选池中的近似变体（数据源 freqMap + 候选池 weightedMap），
@@ -1066,16 +1232,24 @@
         if (state.pendingMsg) {
             const now = Date.now();
             const due = now - state.lastRetryTime >= TIMING.RETRY_DELAY_MS;
+            // 修复：SEND_FAILED（输入框未清空）不重试——可能实际已发出，
+            //      重发只会造成重复弹幕；仅"明确未发出"的错误才重试
+            const retryable = state.lastErrorCode && state.lastErrorCode !== 'SEND_FAILED';
 
-            if (state.retryCount < TIMING.RETRY_MAX_ATTEMPTS && due) {
+            if (state.retryCount < TIMING.RETRY_MAX_ATTEMPTS && due && retryable) {
                 state.retryCount++;
                 state.lastRetryTime = now;
                 await sendMessage(state.pendingMsg);
-            } else if (state.retryCount >= TIMING.RETRY_MAX_ATTEMPTS) {
-                Logger.warn('烂梗机', `超过最大重试次数，丢弃: ${state.pendingMsg}`);
+            } else if (state.retryCount >= TIMING.RETRY_MAX_ATTEMPTS || !retryable) {
+                if (!retryable) {
+                    Logger.warn('烂梗机', `SEND_FAILED 不重试（可能已发出），丢弃: ${state.pendingMsg}`);
+                } else {
+                    Logger.warn('烂梗机', `超过最大重试次数，丢弃: ${state.pendingMsg}`);
+                }
                 state.pendingMsg = null;
                 state.retryCount = 0;
                 state.lastRetryTime = 0;
+                state.lastErrorCode = null;
             }
             return;
         }
@@ -1114,8 +1288,19 @@
     /** 单一调度链：runBot → 计算间隔 → 设置 mainTimer */
     function scheduleNext() {
         if (!state.isRunning) return;
+        // 单链守卫：runBot 是异步的，在 await 期间 mainTimer 尚未指向新定时器，
+        // switchMode()（被 UI 循环每秒调用）会误判「无调度」而再次启动一条链，
+        // 导致双链并存 → 一次发送两条弹幕。busy 标志彻底堵住该重入窗口。
+        if (state.schedulerBusy) return;
 
+        state.schedulerBusy = true;
+        const epoch = state.epoch; // 捕获当前代际：停止后旧链回调不得再动调度状态
         runBot().catch(e => logError('scheduleNext.runBot', e)).then(() => {
+            // 修复：stopBot 会把 schedulerBusy 强制复位，若旧 runBot 仍在飞行，
+            //      快速关→开时旧链回调会清掉新链的 busy 标志并重复 setTimeout
+            //      → 双链复活。epoch 不一致说明本链已被 stopBot 作废，直接丢弃。
+            if (epoch !== state.epoch) return;
+            state.schedulerBusy = false;
             if (!state.isRunning) return;
 
             const interval = state.pendingMsg
@@ -1141,11 +1326,14 @@
         if (oldMode !== state.currentMode) {
             Logger.debug('模式切换', `${oldMode} -> ${state.currentMode} (DPM=${dpm})`);
         }
-        if (!state.mainTimer) scheduleNext();
+        // 仅当既无已排定定时器、也无正在执行的调度链时才启动新链，防止双链竞态
+        if (!state.mainTimer && !state.schedulerBusy) scheduleNext();
     }
 
     function stopBot() {
+        state.epoch++; // 作废旧调度链：飞行中的 runBot 回调凭 epoch 自毁
         if (state.mainTimer) { clearTimeout(state.mainTimer); state.mainTimer = null; }
+        state.schedulerBusy = false; // 中断可能正在执行的调度链
         if (state.countdownTimer) { clearInterval(state.countdownTimer); state.countdownTimer = null; }
         if (state.danmuObserver) {
             try { state.danmuObserver.disconnect(); } catch (_) { /* 忽略 */ }
@@ -1174,6 +1362,12 @@
         if (state.danmuObserver) return; // 已在监听中
 
         const container = parser.findContainer();
+        // 修复：findContainer 现在找不到时返回 null —— 容器未就绪时不启动监听，
+        //      由 startContainerPolling 继续轮询接管（避免对 null 启动 observer）
+        if (!container) {
+            Logger.debug('烂梗机', '容器未就绪，等待轮询接管');
+            return;
+        }
         state.containerElement = container;
         startDanmuObserver(container);
         Logger.info('烂梗机', '弹幕监听已重新启动');
@@ -1287,9 +1481,15 @@
         }).filter(Boolean).join('\n');
     }
 
+    /**
+     * 解析屏蔽词/优先词列表（/ 或 , 分隔）。
+     * 修复：旧实现以 / 为分隔符会把正则条目 /广告/ 的斜杠拆没，
+     *      isRegexPattern 永远匹配不到 → 设置页无法录入正则。
+     *      改为正则切分：保留 /.../ 段为独立词条，其余按 / 或 , 分隔。
+     */
     function parseDelimitedList(raw) {
-        const sep = raw.includes('/') ? '/' : ',';
-        return raw.split(sep).map(s => s.trim()).filter(Boolean);
+        const matches = String(raw).match(/\/[^/]+\/|[^/,]+/g) || [];
+        return matches.map(s => s.trim()).filter(Boolean);
     }
 
     // =========================================================================
@@ -1340,6 +1540,12 @@
     transition: opacity 0.3s;
 }
 #bot-panel:hover { opacity: 1; }
+/* 拖动中：提升合成层 + 禁用过渡，保证跟手（配合 transform 拖动） */
+#bot-panel.bot-dragging {
+    transition: none !important;
+    will-change: transform;
+}
+#bot-panel.bot-dragging:hover { opacity: 1; }
 #bot-panel-header {
     padding: 8px 12px;
     background: var(--bot-border);
@@ -1465,60 +1671,101 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
     }
 
     // =========================================================================
-    // 模块 21：UI - 面板拖拽
+    // 模块 21：UI - 面板拖拽（性能优化版）
     // =========================================================================
+    /**
+     * 性能优化：1) 用 transform: translate3d 替代 left/top —— 只触发合成
+     *              不触发 layout（reflow），拖动不跟手的主因是 left/top
+     *              每帧强制重排整个文档布局；
+     *            2) requestAnimationFrame 合并高频 pointermove，每帧只应用一次；
+     *            3) Pointer Events + setPointerCapture 替代 document 级
+     *              mousemove/mouseup 监听，事件不丢失、无监听器泄漏。
+     */
+    /** 面板位置视口 clamp：确保 left/top 不超出可视区域（分辨率/窗口变化后不会跑出屏幕外） */
+    function clampPanelPos(panel, left, top) {
+        const margin = 8;
+        const maxLeft = Math.max(margin, window.innerWidth - panel.offsetWidth - margin);
+        const maxTop = Math.max(margin, window.innerHeight - panel.offsetHeight - margin);
+        const cl = Math.min(Math.max(margin, left), maxLeft);
+        const ct = Math.min(Math.max(margin, top), maxTop);
+        return { left: cl + 'px', top: ct + 'px' };
+    }
+
     function setupPanelDrag() {
         const panel = $('bot-panel');
         const header = $('bot-panel-header');
         if (!panel || !header) return;
 
+        let pointerId = null;   // 当前拖动的指针 ID
+        let rafId = null;       // RAF 句柄
+        let startX = 0, startY = 0;
+        let deltaX = 0, deltaY = 0;   // 目标偏移（mousemove 只更新这里）
         let isDragging = false;
-        let startX, startY, startLeft, startTop, offsetX, offsetY;
 
-        header.addEventListener('mousedown', (e) => {
+        // RAF 单帧应用 transform（合并高频 move 事件）
+        const applyTransform = () => {
+            rafId = null;
+            panel.style.transform = `translate3d(${deltaX}px, ${deltaY}px, 0)`;
+        };
+        const scheduleRender = () => {
+            if (rafId === null) rafId = requestAnimationFrame(applyTransform);
+        };
+
+        const onPointerDown = (e) => {
             if (e.button !== 0) return;
+            // 设置按钮不参与拖动（保留点击打开设置的行为）
+            if (e.target.closest && e.target.closest('#bot-settings-btn')) return;
             e.preventDefault();
 
             const rect = panel.getBoundingClientRect();
+            pointerId = e.pointerId;
             startX = e.clientX;
             startY = e.clientY;
-            startLeft = rect.left;
-            startTop = rect.top;
-
-            // 切换为绝对定位
-            panel.style.transform = '';
-            panel.style.left = rect.left + 'px';
-            panel.style.top = rect.top + 'px';
-            panel.style.right = 'auto';
-            panel.style.bottom = 'auto';
-
+            deltaX = 0;
+            deltaY = 0;
             isDragging = false;
-            offsetX = 0;
-            offsetY = 0;
 
-            const onMove = (ev) => {
-                offsetX = ev.clientX - startX;
-                offsetY = ev.clientY - startY;
-                if (Math.abs(offsetX) > 3 || Math.abs(offsetY) > 3) isDragging = true;
-                if (!isDragging) return;
-                panel.style.left = (startLeft + offsetX) + 'px';
-                panel.style.top = (startTop + offsetY) + 'px';
-            };
+            panel.classList.add('bot-dragging');
+            try { header.setPointerCapture(pointerId); } catch (_) { /* 忽略 */ }
+        };
 
-            const onUp = (ev) => {
-                document.removeEventListener('mousemove', onMove);
-                document.removeEventListener('mouseup', onUp);
+        const onPointerMove = (e) => {
+            if (pointerId === null || e.pointerId !== pointerId) return;
+            deltaX = e.clientX - startX;
+            deltaY = e.clientY - startY;
+            if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) isDragging = true;
+            if (!isDragging) return;
+            scheduleRender();  // 只更新偏移，由 RAF 统一应用
+        };
 
-                if (isDragging) {
-                    GM_setValue(STORAGE_KEYS.PANEL_POS, { left: panel.style.left, top: panel.style.top });
-                } else if (!ev.target.closest('#bot-settings-btn')) {
-                    panel.classList.toggle('bot-panel-collapsed');
-                }
-            };
+        const finishDrag = (e) => {
+            if (pointerId === null) return;
+            if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+            try { header.releasePointerCapture(pointerId); } catch (_) { /* 忽略 */ }
+            pointerId = null;
+            panel.classList.remove('bot-dragging');
 
-            document.addEventListener('mousemove', onMove);
-            document.addEventListener('mouseup', onUp);
-        });
+            if (isDragging) {
+                // 以最终位置（含 transform）固化为 left/top 并保存（兼容原存储格式）
+                const rect = panel.getBoundingClientRect();
+                panel.style.transform = '';
+                // 修复：保存前视口 clamp，防止面板被拖出屏幕外
+                const pos = clampPanelPos(panel, rect.left, rect.top);
+                panel.style.left = pos.left;
+                panel.style.top = pos.top;
+                panel.style.right = 'auto';
+                panel.style.bottom = 'auto';
+                GM_setValue(STORAGE_KEYS.PANEL_POS, pos);
+            } else {
+                // 未拖动 = 点击 header，折叠/展开
+                panel.classList.toggle('bot-panel-collapsed');
+            }
+        };
+
+        header.addEventListener('pointerdown', onPointerDown);
+        header.addEventListener('pointermove', onPointerMove);
+        header.addEventListener('pointerup', finishDrag);
+        header.addEventListener('pointercancel', finishDrag);
     }
 
     function loadPanelPosition() {
@@ -1527,8 +1774,11 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
             if (!panel) return;
             const pos = GM_getValue(STORAGE_KEYS.PANEL_POS, null);
             if (pos && pos.left && pos.top) {
-                panel.style.left = pos.left;
-                panel.style.top = pos.top;
+                panel.style.transform = '';   // 清除可能残留的拖动偏移
+                // 修复：加载时同样 clamp（旧存档可能在当前视口外）
+                const saved = clampPanelPos(panel, parseFloat(pos.left) || 0, parseFloat(pos.top) || 0);
+                panel.style.left = saved.left;
+                panel.style.top = saved.top;
                 panel.style.bottom = 'auto';
                 panel.style.right = 'auto';
             }
@@ -1605,11 +1855,6 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
     }
 
     function updateCountdownDisplay() {
-        if (state.countdownTimer) {
-            clearInterval(state.countdownTimer);
-            state.countdownTimer = null;
-        }
-
         const cdEl = $('bot-status-countdown');
         if (!cdEl) return;
 
@@ -1618,9 +1863,16 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
                 const remaining = state.nextSendTimestamp - Date.now();
                 cdEl.textContent = remaining <= 0 ? '发送中' : (remaining / 1000).toFixed(1) + 's';
             };
-            tick();
-            state.countdownTimer = setInterval(tick, 100);
+            // 修复：复用已存在的 interval——旧实现每秒销毁重建 100ms 定时器
+            if (!state.countdownTimer) {
+                tick();
+                state.countdownTimer = setInterval(tick, 100);
+            }
         } else {
+            if (state.countdownTimer) {
+                clearInterval(state.countdownTimer);
+                state.countdownTimer = null;
+            }
             cdEl.textContent = '--';
         }
     }
@@ -1650,6 +1902,10 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
         });
 
         overlay.addEventListener('click', e => handleSettingsClick(e, overlay));
+
+        // 修复：打开设置页时主动渲染错误日志——旧代码只在点「清空日志」时才
+        //      调用 renderDebugLogs，日志区与角标永远空白、形同虚设
+        renderDebugLogs();
     }
 
     function createElement(tag, attrs = {}) {
@@ -1719,6 +1975,8 @@ ${buildSection('⚡ 模式设置', `
   ${buildInputRow('s-crazyDpm', '疯狂阈值 DPM', cfg.crazyModeDPM, 10)}
   ${buildInputRow('s-crazyInterval', '疯狂间隔(秒)', cfg.crazyInterval, 1)}
   ${buildInputRow('s-normalDpm', '正常阈值 DPM', cfg.normalModeDPM, 10)}
+  ${buildInputRow('s-normalIntervalMin', '正常间隔最小(秒)', cfg.normalIntervalMin, 1)}
+  ${buildInputRow('s-normalIntervalMax', '正常间隔最大(秒)', cfg.normalIntervalMax, 1)}
   ${buildInputRow('s-zenInterval', '佛系间隔(秒)', cfg.zenInterval, 1)}
 `)}
 
@@ -1767,11 +2025,14 @@ ${buildDebugSection()}
     }
 
     function buildInputRow(id, label, value, min, max, step) {
-        const stepAttr = step ? `step="${step}"` : '';
+        const stepAttr = step !== undefined ? `step="${step}"` : '';
+        // 修复：min=0 时 `min ? ...` 会丢失属性（如去重窗口允许 0），改用 undefined 判断
+        const minAttr = min !== undefined ? `min="${min}"` : '';
+        const maxAttr = max !== undefined ? `max="${max}"` : '';
         return `
 <div class="row" style="display:flex;align-items:center;margin-bottom:4px;gap:6px;flex-wrap:wrap;">
   <label style="width:80px;font-size:var(--bot-font-size,12px);color:var(--bot-text,#aaa);flex-shrink:0;">${label}</label>
-  <input type="number" id="${id}" value="${value}" ${min ? `min="${min}"` : ''} ${max ? `max="${max}"` : ''} ${stepAttr}
+  <input type="number" id="${id}" value="${value}" ${minAttr} ${maxAttr} ${stepAttr}
     style="background:var(--bot-border,rgba(255,255,255,0.06));border:1px solid var(--bot-border,rgba(255,255,255,0.12));color:var(--bot-text,#eee);border-radius:4px;padding:3px 5px;font-size:var(--bot-font-size,12px);flex:1;min-width:50px;">
 </div>`;
     }
@@ -1827,7 +2088,13 @@ ${buildDebugSection()}
     // =========================================================================
     function saveSettingsFromUI(overlay) {
         const getVal = (id) => { const el = overlay.querySelector('#' + id); return el ? el.value : ''; };
-        const getNum = (id) => parseFloat(getVal(id)) || 0;
+        // 修复：空输入返回 NaN（循环内跳过，保持原值）——旧实现 parseFloat('')||0
+        //      把清空的字段保存成 0（如最短长度清空 → 单字符弹幕全入候选）
+        const getNum = (id) => {
+            const v = getVal(id);
+            if (v.trim() === '') return NaN;
+            return parseFloat(v);
+        };
         const getBool = (id) => { const el = overlay.querySelector('#' + id); return el ? el.checked : false; };
         const getText = (id) => getVal(id);
 
@@ -1842,11 +2109,15 @@ ${buildDebugSection()}
             crazyModeDPM: 's-crazyDpm',
             crazyInterval: 's-crazyInterval',
             normalModeDPM: 's-normalDpm',
+            normalIntervalMin: 's-normalIntervalMin',
+            normalIntervalMax: 's-normalIntervalMax',
             zenInterval: 's-zenInterval',
             priorityWeight: 's-priorityWeight',
         };
         for (const [key, id] of Object.entries(numConfig)) {
-            saveConfigValue(key, getNum(id));
+            const num = getNum(id);
+            if (Number.isNaN(num)) continue; // 空输入保持原值
+            saveConfigValue(key, num);
         }
 
         saveConfigValue('priorityEnabled', getBool('s-priorityEnabled'));
@@ -1898,6 +2169,8 @@ ${buildDebugSection()}
             's-crazyDpm': def.crazyModeDPM,
             's-crazyInterval': def.crazyInterval,
             's-normalDpm': def.normalModeDPM,
+            's-normalIntervalMin': def.normalIntervalMin,
+            's-normalIntervalMax': def.normalIntervalMax,
             's-zenInterval': def.zenInterval,
             's-priorityWeight': def.priorityWeight,
             's-blocklist': '',
@@ -1986,15 +2259,44 @@ ${buildDebugSection()}
                 if (container) {
                     clearInterval(tryFind);
                     state.containerElement = container;
-                    startDanmuObserver(container);
-                    scheduleWeightUpdate();
+                    // 修复：若用户已提前打开开关（ensureObserverRunning 已启动监听），
+                    // 不可重复 startDanmuObserver——它会 freqMap.clear() 清空已采集数据，
+                    // 且产生双 observer 导致每条弹幕重复计数（count 翻倍、权重虚高）
+                    if (!state.danmuObserver) {
+                        startDanmuObserver(container);
+                        scheduleWeightUpdate();
+                    } else {
+                        Logger.debug('烂梗机', 'observer 已运行，跳过容器轮询启动');
+                    }
+                    return;
+                }
+                // 1.1.17：B 站 blanc 让位检查（置于 body 降级之前）——一旦检测到
+                // blanc iframe，主文档实例净化退出：移除面板、断开 observer、
+                // 周期任务空转（standDown），由 blanc iframe 实例接管采集。
+                // 顺序提前确保 blanc 晚于 45s 轮询窗口出现时同样生效。
+                if (PLATFORM === 'bilibili'
+                    && document.querySelector('iframe[src*="/blanc/"]')) {
+                    clearInterval(tryFind);
+                    state.standDown = true;
+                    state.isRunning = false;
+                    if (state.danmuObserver) {
+                        try { state.danmuObserver.disconnect(); } catch (_) { /* 忽略 */ }
+                        state.danmuObserver = null;
+                    }
+                    if (state.mainTimer) { clearTimeout(state.mainTimer); state.mainTimer = null; }
+                    if (state.countdownTimer) { clearInterval(state.countdownTimer); state.countdownTimer = null; }
+                    const idlePanel = document.getElementById('bot-panel');
+                    if (idlePanel) idlePanel.remove();
+                    Logger.debug('烂梗机', '检测到 blanc iframe，主文档让位给 iframe 实例（面板已移除）');
                     return;
                 }
                 if (poll >= TIMING.CONTAINER_POLL_MAX) {
                     clearInterval(tryFind);
                     Logger.warn('烂梗机', '弹幕容器查找超时，监听整个文档');
                     state.containerElement = document.body;
-                    startDanmuObserver(document.body);
+                    if (!state.danmuObserver) {
+                        startDanmuObserver(document.body);
+                    }
                 }
             } catch (e) {
                 logError('容器查找', e);
@@ -2006,22 +2308,26 @@ ${buildDebugSection()}
     function startPeriodicTasks() {
         // 候选强制刷新（10s）——只负责权重重算，不重复刷 UI
         setInterval(() => {
-            if (!state.isRunning) return;
+            if (state.standDown || !state.isRunning) return;
             state.danmuDirty = true;
             updateWeights();
         }, TIMING.CANDIDATE_REFRESH_INTERVAL);
 
-        // UI 更新与配置同步（2s）
+        // UI 更新与配置同步（1s）
         setInterval(() => {
+            if (state.standDown) return; // 让位后空转：不刷新面板/不重启调度
             checkConfigUpdate();
             if (state.isRunning) switchMode();
             const candidates = getWeightedCandidates();
-            state.nextPreviewMsg = candidates[0]?.text || '';
+            // 修复：预览只在空时填充——runBot 发送后已把 nextPreviewMsg 设为
+            //      实际选中的候选，UI 循环再覆盖为 top1 会导致预览与实发不一致
+            if (!state.nextPreviewMsg) state.nextPreviewMsg = candidates[0]?.text || '';
             updateUIDisplay(getMessagesPerMinute());
         }, TIMING.UI_UPDATE_INTERVAL);
 
         // 发送器缓存刷新（30s）
         setInterval(() => {
+            if (state.standDown) return;
             try { sender.refreshCache(); } catch (_) { /* 忽略 */ }
         }, 30000);
     }
