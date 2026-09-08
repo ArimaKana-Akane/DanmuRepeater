@@ -1,0 +1,11 @@
+{
+  "name": "@lgj/adapter-bilibili",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@lgj/core": "1.2.0"
+  }
+}

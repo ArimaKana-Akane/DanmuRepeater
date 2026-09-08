@@ -1,0 +1,6 @@
+node_modules/
+# 保留 dist/*.user.js（可直接从 GitHub Raw 安装）；只忽略构建临时文件
+dist/_hybrid_check.js
+*.tsbuildinfo
+.DS_Store
+coverage/

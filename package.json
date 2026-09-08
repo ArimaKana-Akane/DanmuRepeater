@@ -1,0 +1,28 @@
+{
+  "name": "langengji-v2",
+  "private": true,
+  "type": "module",
+  "version": "1.2.0",
+  "description": "烂梗机 1.2.0 工程（L0 地基）——功能与 1.1.20 行为冻结等价",
+  "workspaces": [
+    "packages/core",
+    "packages/entry",
+    "packages/ui",
+    "packages/adapters/*"
+  ],
+  "scripts": {
+    "build": "node scripts/check-md5.mjs && node scripts/build-hybrid.mjs && node scripts/verify-dist.mjs",
+    "build:frozen": "node scripts/build-frozen.mjs",
+    "typecheck": "tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/adapters/bilibili/tsconfig.json",
+    "test": "vitest run",
+      "verify": "npm run typecheck && npm test && npm run build",
+      "verify:dist": "node scripts/verify-dist.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

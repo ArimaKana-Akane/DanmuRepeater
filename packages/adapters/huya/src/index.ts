@@ -1,0 +1,2 @@
+// adapters/huya — 占位（0.2/0.3 迁移填充）
+export {}

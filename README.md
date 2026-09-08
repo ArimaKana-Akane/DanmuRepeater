@@ -5,7 +5,7 @@
 
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-✓-green.svg)](https://www.tampermonkey.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.1.20-orange.svg)
+![Version](https://img.shields.io/badge/version-1.2.0-orange.svg)
 
 「烂梗机」是一个运行在浏览器中的油猴脚本，监听直播间弹幕流，识别高频 / 热门弹幕，并自动在聊天框复读。支持 **斗鱼 / 虎牙 / Bilibili / 抖音** 四大直播平台。
 
@@ -41,7 +41,7 @@
 ### 安装步骤
 
 1. 安装 Tampermonkey 浏览器扩展
-2. 打开 [烂梗机-1.1.20.user.js](./烂梗机-1.1.20.user.js) 原始文件页（Raw 模式）
+2. 打开 [latest.user.js](./dist/latest.user.js)（即 dist/烂梗机-1.2.0.user.js）的原始文件页（Raw 模式），Tampermonkey 会检测到版本更新
 3. Tampermonkey 自动弹出安装确认，点击 **安装**
 4. 打开任意支持平台的直播间，右下角出现 🤖 悬浮面板即安装成功
 
@@ -153,14 +153,18 @@ MutationObserver 采集（精准节点识别）
 
 ```
 .
-├── 烂梗机-1.1.20.user.js    # 主脚本（单文件，带版本号，可直接安装）
-├── README.md               # 本文档
-├── CHANGELOG.md            # 更新日志（完整版本历史）
-├── LICENSE                 # MIT 许可证
-└── .test/
-    ├── test_119.mjs        # jsdom 集成测试（采集/候选/发送/屏蔽/配置）
-    ├── verify_observer2.mjs # 开关循环 observer 恢复回归测试
-    └── mock_douyu_batch.html # 本地模拟斗鱼页面（批量渲染弹幕）
+├── dist/
+│   ├── 烂梗机-1.2.0.user.js  # 发布产物（1.1.20 基线 + Hybrid 注入，可直接安装）
+│   └── latest.user.js        # 最新版别名（自动更新 / CI 产物指向此）
+├── legacy/
+│   └── 烂梗机-1.1.20.user.js # 行为冻结基线（升级前请删除旧版脚本防双实例）
+├── packages/                 # Monorepo：core(引擎/安全阀/存储) + adapters + UI
+├── scripts/                  # 构建链（精确补丁 + 内联 + 语法校验）+ hybrid 纯逻辑
+├── tests/                    # Vitest（含发布核心单测）
+├── CHANGELOG.md              # 更新日志（v1.1.8 → v1.2.0）
+├── README.md                 # 本文档
+├── LICENSE                   # MIT 许可证
+└── 烂梗机-1.1.20.user.js     # 历史版本存档
 ```
 
 ### 模块划分（脚本内 SECTION）
@@ -178,7 +182,16 @@ MutationObserver 采集（精准节点识别）
 
 ## 🔄 版本历史
 
-### v1.1.20（当前）
+### v1.2.0（当前）
+
+- 🚀 **双模式引擎**：DOM（兼容原行为）与**协议数据流**可切换，B站/斗鱼支持协议直连源，其余平台自动回落 DOM
+- 🔐 **安全阀**：风险确认、分钟/小时/日硬上限、同句冷却、平台风控熔断，计数持久化跨标签合并
+- 📡 **B 站原生发送**（默认关闭）+ L2 结构化加权 + 多标签 leader 选举 + 系统弹幕智能识别
+- 🎛 **界面二级化**：一级只留关键状态，引擎/发送/诊断移至设置页；CI 自动注入自动更新元数据
+
+> 📜 完整 1.2.0 变更见 [CHANGELOG.md](./CHANGELOG.md#120---2026-09-09)
+
+### v1.1.20（上一版）
 
 - 🐛 修复：`queryAll` 多选择器重叠导致同一弹幕重复采集（Set 去重）
 - 🐛 修复：body 降级后开关无法恢复采集；发送重试成功后候选立即刷新
@@ -189,6 +202,7 @@ MutationObserver 采集（精准节点识别）
 
 ### 近期要点回顾
 
+- **v1.2.0**：Hybrid 双引擎（DOM+协议切换、B站原生发送、安全阀、多标签、事件日志，详见 CHANGELOG）
 - **v1.1.19**：网页全屏隐藏面板重写为四路综合判定（原生全屏 / 类名 / 平台容器标记 / 几何兜底），修复斗鱼、虎牙、抖音网页全屏漏判
 - **v1.1.18**：全平台统一「证据驱动」发送模型 —— 发送后仅当确认输入框未清空才补 Enter，根治抖音「一次发两条」
 - **v1.1.17**：系统弹幕过滤、斗鱼受控输入同步、多版本共存告警、B 站让位净化

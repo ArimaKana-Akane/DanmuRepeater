@@ -11,6 +11,103 @@
 
 ---
 
+
+## [1.2.0] - 2026-09-09
+
+### 修复（P0）
+
+- **双源叠加**：协议源与 DOM 源同时写 `freqMap`/`timestamps` → 频次、DPM 翻倍。改为
+  双源互斥切换（协议接管时暂停 DOM 并清空旧统计），并对 `ensureObserverRunning`、
+  `startContainerPolling` 容器命中分支、body 降级分支三处都加协议守卫。
+- **B 站房间号解析**：`/blanc/`、`/h5/`、`?room_id=` 及同源父文档兜底；短号先经
+  `room_init` 解析真实房号，协议采集与原生发送都使用真房号。
+- **安全阀可被绕过**：残缺配置 / 导入校验层级错误曾让硬上限失效。改为
+  `mergeSafetyConfig` 合并默认 + 只可更严 + `enabled` 恒 `true`；
+  `validateConfigBundle` 校验到 `config` 内部。
+- **安全计数易失**：计数只在内存，刷新 / 多标签即清零。改为持久化 +
+  `GM_addValueChangeListener` 跨标签按分钟槽合并。
+
+### 修复（P1）
+
+- 协议源随机器人开关启停；未启用时不建立 wss 连接。
+- 协议断线指数退避重连（2s / 4s / 8s），3 次失败回落 DOM 并更新状态。
+- `SAFETY_RANDOM_SKIP` 标记为不可重试，随机跳过真正生效。
+- 面板被 SPA 重建后，自动重挂引擎 / 发送 / 工具 UI 与风险确认横幅。
+- 持久化环形日志读回内存，设置页导出与诊断可见；写入改为 2s 节流。
+- `parseDelimitedList` 改为只按换行分隔，避免 `/a,b/` 这类含逗号的正则被拆坏。
+
+### 新增
+
+- **B 站原生发送（默认关闭，UI 可切）**：`GM_xmlhttpRequest`（绕 CORS、带 cookie）+
+  `room_init` + `POST /msg/send`；`mapBiliSendCode()` 归一化返回码。未登录 / CSRF 缺失 /
+  非 B 站才回落 DOM；平台明确拒绝或网络异常一律 `SEND_FAILED` 且**不回落**，避免双发。
+- **L2 结构化加权**：协议 `uid/nick/ts` 进入 `metaMap`，`__lgjMetaBoost` 按
+  「独立发送者数 + 频次 + 新鲜度」给候选加权（上限 1.8，DOM 模式为 1）。
+- **L4 多标签 leader 选举**：带过期租约 + 写后回读 + `BroadcastChannel` 心跳；
+  `isLeader()` 发送前再校验租约；仅 leader 发送；B 站 blanc 让位时释放租约。
+- **发布元数据自动识别**：`GITHUB_REPOSITORY`（CI）→ `git remote get-url origin` →
+  `package.json repository` → `meta.json` 兜底；识别到即注入
+  `@homepageURL/@updateURL/@downloadURL`。`@version` 从 `package.json` 读取。
+- **产物守卫** `scripts/verify-dist.mjs`：22 项修复标记缺一即构建失败；
+  `npm run verify` = typecheck + test + build + 产物守卫。
+
+### 工程
+
+- 纯逻辑抽到 `scripts/hybrid/hybrid-core.mjs`（Vitest 直接 import、构建时剥离 `export` 内联），
+  解决「测 A 发 B」。
+- 新增 `packages/core/test/hybrid-core.test.ts`（19 例：房间号 / 安全配置 / 导出校验 /
+  安全阀 / 协议返回码 / leader 选举）。
+- CI 兼容两种仓库布局（项目在根目录，或作为 `v2/` 子目录）。
+
+### 数据源生命周期（吸收斗鱼生产实测版）
+
+- **auth 成功才接管**：先连 wss，收到 op8 `{"code":0}` 后才暂停 DOM 并开始 feed；
+  握手期间 DOM 继续采集，**没有探测空窗**。
+- **掉线立即回 DOM**：`onProtocolDrop()` 立刻恢复 DOM，按模式退避（协议 8s / 自动 30s）
+  后再探，不在 DOM 空窗里连续重连。
+- **单一 `tick()` 生命周期**：开关 / leader / 模式 / 退避全部收敛；非 leader 标签页
+  `standbySources()` 完全不采集。
+- **真实房号**：`getInfoByRoom` 优先、`room_init` 兜底，短号也能正确 `getDanmuInfo`。
+- **回落保留统计**：`__lgjKeepStats` 让协议掉线回落 DOM 时不 `freqMap.clear()`，
+  候选池无需 2 分钟重建。
+
+### 系统弹幕智能识别
+
+- 关键词启发式扩充到多平台：欢迎语 / 系统公告 / 关注 / 礼物 / 进场 / 粉丝团 /
+  大航海 / 中奖 / 签到 / 风控（禁言、封号、管理员）等，长文本（>80）不误杀。
+- DOM 路径增加**结构判定** `__lgjIsSystemNode`：节点/父节点类名含
+  `system/notice/gift/welcome/enter` 等直接排除。
+- legacy `isSystemDanmaku` 委托到 `hybrid-core` 的增强实现，协议与 DOM 两路一致。
+- 系统过滤计数 `__lgjCountSystemFiltered`：每 20 条记一次样本，60s 摘要里汇总。
+
+### 界面二级化
+
+- 一级面板恢复简洁：只保留状态、上次/下次、开关、风险确认、一行引擎状态。
+- **引擎**、**发送**、**导入/导出/诊断** 全部移到二级设置页：
+  - 引擎 = 直连开关（关 = DOM，开 = 协议直连）+「切到智能模式」；
+  - 发送 = 协议直发开关（默认关 = DOM 模拟）；
+  - 配置管理 = 导出 / 导入 / 诊断。
+- **智能模式不可用**（非 B 站 / 协议探测失败/退避中）时，一级面板出现
+  「直连引擎」快捷开关（关 = DOM，开 = 直连），与发送开关同样的切换样式。
+
+### 日志升级
+
+- 新增 `event` 级别与 `logEvent()`：记录引擎切换、协议连接/接管/掉线/回落、
+  数据源切换、智能模式不可用、leader、安全阀拦截、选择决策、配置导入导出等。
+- 发送日志带上下文：`模式/DPM/来源/权重/boost/候选`，不再只有「发送成功: xxx」。
+- 60s 采集摘要：`DPM / 候选 / freq / 系统过滤 / 来源 / 模式 / 引擎`。
+- 设置页日志区：全部 / 事件 / 发送 / 警告 / 错误 / 信息 级别筛选 + 搜索 + 详细开关，
+  显示最近 300 条（覆盖 legacy 只显示 error 的实现）。
+
+### 已知风险
+
+- 「复读」本身是风控对抗，硬约束只能降低风险，不能消除。
+- 协议直发与页面自身 `/msg/send` 的参数 / Header 并非完全一致，仍可能被单独标记。
+- 自连 WS ≠ Hook 页面已有 WS：多一条连接、需要 wbi 签名，隐蔽性较弱。
+- 目前只有 B 站有协议源；斗鱼 / 虎牙 / 抖音仍依赖 DOM 选择器。
+- 多标签 leader 依赖 GM 存储跨标签共享；隔离存储时存在最多一个心跳周期（5s）的收敛窗口。
+- 网络歧义下「宁可不发不可双发」，代价是偶发漏发。
+
 ## [1.1.20] - 2026-09-09
 
 ### 修复（1.1.18 / 1.1.19 复核遗留项）
