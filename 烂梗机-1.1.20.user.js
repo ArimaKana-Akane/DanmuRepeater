@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         烂梗机
 // @namespace    http://tampermonkey.net/
-// @version      1.1.17
+// @version      1.1.20
 // @description  多平台自动复读弹幕 | 智能去重 | 候选实时刷新(限50) | 模块化重构
 // @match        https://www.douyu.com/*
 // @match        https://www.huya.com/*
@@ -73,6 +73,52 @@
 //             L 倒计时定时器复用（不再每秒重建）；预览与实发一致；
 //             L escapeHtml 转义引号；清理死代码（clearRegexCache、
 //                MAX_HISTORY_SIZE_FALLBACK）
+// 1.1.18 修复（1.1.17 复核清单驱动）：
+//             P0 双发修复——1.1.17 在 _sendDouyin/_sendHuya/_sendGeneric 的按钮点击后
+//                「无条件」追加 Enter，而平台清空输入框是异步的 → 点击已生效时
+//                Enter 会再发一次（抖音实测严重；斗鱼登录态同样会中招）。
+//                改为全平台统一「证据驱动」模型：发送动作后，仅当宽限轮询确认
+//                「输入框仍未清空」才补发 Enter（最多一次）。
+//                - 按钮有效 → 已清空 → 不补 Enter → 单发（抖音双发根治）
+//                - 按钮灰态/无效（实测斗鱼 is-gray）→ 未清空 → 补 Enter →
+//                  照常发得出去（斗鱼 Enter 兜底完整保留，只是从无条件变为有条件）
+//                - B 站无可靠按钮，Enter 即主发送动作，逻辑不变且更安全
+//             P1 设置页「透明度」清空保存写入 NaN（NaN 跳过只覆盖数值循环，
+//                未覆盖 theme.opacity）→ 面板 --bot-opacity: NaN
+//             P1 面板模式一旦出错永久显示「错误」——改为只统计最近 2 分钟的 error
+//             P2 isSystemDanmaku 关键词过宽（「本直播间」会误杀正常弹幕）
+//                改为前缀锚定 + 短文本限定
+//             P2 standDown 让位检查原本写在容器轮询内，主文档若先命中容器则
+//                clearInterval 后永不触发 → 抽成独立 yieldToBlancFrame +
+//                1s 周期检查 startBlancYieldWatch（覆盖 45s body 降级后的晚插入）
+// 1.1.19 修复（真机反馈驱动）：
+//             P0 网页全屏不隐藏面板——「网页全屏」是站点自绘状态（非 Fullscreen
+//                API），document.fullscreenElement 恒为 null，而旧检测只认
+//                body.player-fullscreen 与 B 站 .layout-Player-barrageStage.fullscreen
+//                两个标记 → 斗鱼/虎牙/抖音网页全屏完全漏判。
+//                重写为四路综合判定：① 原生全屏（含 webkit/moz/ms 前缀）
+//                ② html/body 类名关键字 ③ 各平台已知容器标记（斗鱼/虎牙/B站/抖音）
+//                ④ 视频铺满视口几何兜底（仅斗鱼/虎牙/B站；抖音直播常态即满屏，
+//                   用几何会永久误判，故排除）；
+//                B 站 blanc iframe 实例额外检查同域父文档状态。
+//                触发方式：fullscreenchange 三前缀事件 + html/body class
+//                MutationObserver（网页全屏无事件，只能观察类名变化）+ 1s 兜底轮询。
+//             P1 状态去重（不再每 1.5s 无条件写 class）+ 全屏时同步隐藏设置浮层
+//                （浮层 z-index 100000，会盖在网页全屏画面上）
+//             P1 standDown（B 站主文档让位）后清理全屏轮询与 observer，不再空转
+// 1.1.20 修复（1.1.18/1.1.19 复核遗留项）：
+//             P2 queryAll 多选择器重叠导致同一条弹幕被重复 capture → Set 去重；
+//             P3 重试成功后「下次」预览停留在刚发出去的消息 → 重试成功立即刷新候选；
+//             P3 body 降级后关闭再打开开关无法恢复采集 → ensureObserverRunning
+//                支持 degradedToBody 恢复，并在真实容器重新出现时清除降级标志；
+//             P0 B 站首发送后增加额外清空宽限（仍不补第二次 Enter），避免
+//                「已发出但清空慢」被误判 SEND_FAILED；
+//             P3 stopBot 强制清 isSending，快速关→开时旧 send 的 finally 可能清掉
+//                新发送的 busy 标志 → 停止时不再强制重置，让飞行中的发送自然结束；
+//             让位后容器轮询/observer 的 standDown 兜底补齐；
+//             设置页数值/主题输入值统一 escapeHtml；
+//             修正 iframe 防重注释：未使用 @noframes，B 站 blanc iframe 需要运行。
+//             注：isSystemDanmaku 的「本直播间」前缀过滤为用户确认的产品行为，本次不动。
 
 (function () {
     'use strict';
@@ -83,7 +129,8 @@
     //       window.dyBotScriptLoaded 防重标记可能失效 → 脚本重复执行
     //       （实测主文档 + 同源 iframe 各注入多次 → 多实例并发发送）。
     // 修复：
-    //   1) iframe 内直接退出（@noframes 兜底 + 代码级双保险）
+    //   1) iframe 内直接退出（代码级排除；未使用 @noframes，
+    //      因为 B 站 blanc iframe 需要运行）
     //   2) 用 document 元素属性做防重标记——同一沙箱内可靠
     // ============================================================
     // 平台感知帧选择（1.1.16 修正，替代 1.1.15 的"B 站主文档一律退出"）：
@@ -109,7 +156,7 @@
     // 防重标记带版本号：检测到其他版本已运行（多版本共存）时醒目告警。
     // 注意：1.1.12 及更早版本不设置此标记，无法拦截，升级前务必删除旧版脚本，
     // 否则同页面多实例并发发送（README/发布说明中需强调）。
-    const INSTALLED_VERSION = '1.1.17';
+    const INSTALLED_VERSION = '1.1.20';
     if (document.documentElement) {
         const marker = document.documentElement.getAttribute('data-lgj-loaded');
         if (marker) {
@@ -238,13 +285,18 @@
 
         _push(level, content) {
             try {
-                this._logs.push({ level, content, time: new Date().toLocaleTimeString() });
+                this._logs.push({ level, content, time: new Date().toLocaleTimeString(), ts: Date.now() });
                 if (this._logs.length > this._maxLogs) this._logs.shift();
             } catch (_) { /* 忽略 */ }
         },
 
         getAll() { return [...this._logs]; },
         getErrors() { return this._logs.filter(l => l.level === 'error'); },
+        /** 最近 windowMs 内的 error（1.1.18：模式显示用，历史错误不永久霸屏） */
+        getRecentErrors(windowMs = 120000) {
+            const cutoff = Date.now() - windowMs;
+            return this._logs.filter(l => l.level === 'error' && (l.ts || 0) >= cutoff);
+        },
         clear() { this._logs = []; },
     };
 
@@ -288,8 +340,14 @@
      * 各平台系统消息文本特征不一，此处用启发式前缀/关键词匹配，命中即丢弃。
      */
     function isSystemDanmaku(text) {
-        return /^(欢迎来到|系统消息|温馨提示|欢迎.{0,12}进入直播间)/.test(text)
-            || /(温馨提示|系统公告|直播间提示|本直播间)/.test(text);
+        const t = String(text).trim();
+        if (!t) return false;
+        // 前缀型：欢迎语 / 系统消息 / 温馨提示 开头的弹幕（各平台通用特征）
+        if (/^(欢迎来到|系统消息|温馨提示|欢迎.{0,12}进入直播间)/.test(t)) return true;
+        // 修复（1.1.18）：第二条例加前缀锚定 + 短文本限定——旧实现 /(...|本直播间)/
+        //      全文匹配会把「本直播间怎么没声音」这类正常弹幕也过滤掉
+        if (t.length <= 40 && /^(温馨提示|系统公告|直播间提示|本直播间)/.test(t)) return true;
+        return false;
     }
 
     // =========================================================================
@@ -319,7 +377,7 @@
                 if (els.length) results.push(...els);
             } catch (_) { /* 无效选择器 */ }
         }
-        return results;
+        return [...new Set(results)];
     }
 
     /** 选择器失败时按类型回退查找（input/button/generic） */
@@ -497,7 +555,10 @@
             if (sel.containerElement && document.contains(sel.containerElement)) {
                 return sel.containerElement;
             }
-            const result = this.probe.probeOne(BASE_SELECTORS[this.platform].danmuContainer);
+            // 1.1.19：未知平台兜底——旧代码 BASE_SELECTORS[platform].danmuContainer
+            //         在平台识别失败时会抛 TypeError，整个采集链路挂掉
+            const base = BASE_SELECTORS[this.platform] || BASE_SELECTORS.douyu;
+            const result = this.probe.probeOne(base.danmuContainer);
             if (result) {
                 this.selectors.containerElement = result.element;
                 this.selectors.danmuContainer = result.selector;
@@ -516,6 +577,21 @@
 
         getDanmuItemSelector() { return this.selectors.danmuItem; }    }
 
+    /**
+     * Enter 兜底策略（1.1.18 P0 双发修复，全平台统一「证据驱动」模型）
+     * 背景：1.1.17 在按钮点击后「无条件」补发 Enter。平台清空输入框是异步的，
+     *       click 返回时内容通常仍在 → 按钮点击其实已生效时再补 Enter 就是双发
+     *       （抖音实测严重；斗鱼登录态按钮有效时同样会中招）。
+     *       Enter 真正被需要的是按钮灰态/点击无效的场景（实测斗鱼 is-gray）。
+     * 统一规则：发送动作（click 或 Enter）后，仅当宽限轮询确认「输入框仍未清空」
+     *       这一明确失败证据时，才补发 Enter（最多一次）——两种平台行为都覆盖：
+     *       - 按钮有效：清空 → 不补 Enter → 单发
+     *       - 按钮灰态/无效：未清空 → 750ms 后补 Enter → 仍能发出去（斗鱼保留）
+     * B 站例外：无可靠按钮，Enter 本身就是主发送动作，直接在点击路径发送；
+     *       1.1.19 起 send() 用 IS_ENTER_PRIMARY 拦掉它的兜底补发（补发必双发）。
+     */
+    const IS_ENTER_PRIMARY = { bilibili: true };   // 其余平台 Enter 一律作兜底
+
     // =========================================================================
     // 模块 9：平台发送器
     // =========================================================================
@@ -526,6 +602,7 @@
             this.cachedInput = null;
             this.cachedButton = null;
             this.lastCacheTime = 0;
+            this._enterFallbackDone = false; // 本次发送是否已用过 Enter 兜底
         }
 
         refreshCache() {
@@ -544,8 +621,9 @@
             if (!msg) return { success: false, errorCode: 'EMPTY_MSG', message: '消息为空' };
             if (!state.isRunning) return { success: false, errorCode: 'STOPPED', message: '机器人已停止' };
 
+            this._enterFallbackDone = false;   // 每次发送独立判定，不跨次继承
             this._ensureCacheFresh();
-            let input = this.cachedInput;
+            let input = this._resolveInput(this.cachedInput);
             let button = this.cachedButton;
 
             if (!input) {
@@ -571,10 +649,40 @@
             // 修复：平台清空输入框有 100-300ms 延迟（B 站 Enter 发送尤甚），
             //      立即校验会误判 SEND_FAILED → 3 秒后重发同一条 → 弹幕重复。
             //      改为宽限轮询：最多 3 次 × 250ms 确认清空。
-            let remaining = this._getInputValue(input).trim();
+            // 1.1.19：每次读取都重新解析输入框——站点重渲染替换节点后，
+            //         读 detached 旧节点会永远「未清空」，既误判又让兜底 Enter 打空
+            const readRemaining = () => {
+                input = this._resolveInput(input) || input;
+                return this._getInputValue(input).trim();
+            };
+            let remaining = readRemaining();
             for (let i = 0; remaining !== '' && i < 3; i++) {
                 await sleep(250);
-                remaining = this._getInputValue(input).trim();
+                remaining = readRemaining();
+            }
+            // 1.1.20：B 站 Enter 是唯一发送手段，不能靠补 Enter 纠错；这里只给首次
+            //         Enter 更长的清空宽限，避免「已发出但清空慢」被误判 SEND_FAILED
+            //         （仍不补第二次 Enter，因此不会双发）。
+            if (IS_ENTER_PRIMARY[this.platform] && remaining !== '') {
+                for (let i = 0; i < 6; i++) {
+                    await sleep(250);
+                    remaining = readRemaining();
+                    if (remaining === '') break;
+                }
+            }
+            // 1.1.18：证据驱动 Enter 兜底——只在「按钮点击/首次 Enter 都没能清空输入框」
+            // 这一明确失败证据下才补发，杜绝按钮点击已生效时的重复发送（全平台统一）
+            // 1.1.19：Enter 已是主发送动作的平台（B 站）不再补第二次 Enter——
+            //         首发的 Enter 若已生效只是清空慢，再补一次就是双发。
+            if (remaining !== '' && !this._enterFallbackDone && !IS_ENTER_PRIMARY[this.platform]) {
+                this._enterFallbackDone = true;
+                Logger.warn('烂梗机', '发送按钮未生效，补发 Enter 兜底');
+                this._pressEnter(input);
+                for (let i = 0; i < 4; i++) {
+                    await sleep(250);
+                    remaining = readRemaining();
+                    if (remaining === '') break;
+                }
             }
             return remaining === ''
                 ? { success: true, errorCode: null, message: '发送成功' }
@@ -588,6 +696,26 @@
             if (!this.cachedInput || !this.cachedButton || age > 30000) {
                 this.refreshCache();
             }
+        }
+
+        /**
+         * 输入框活性解析（1.1.19）。
+         * 问题：React/Vue 重渲染会直接替换 input 节点，缓存里留的是 detached 旧节点——
+         *   读取它的 value 永远是「未清空」，既误判 SEND_FAILED，也让 Enter 兜底
+         *   派发到游离节点上（发不出去，斗鱼灰态兜底失效）。
+         * 修复：每次读取前确认节点仍在文档中，不在则重新查找。
+         */
+        _resolveInput(input) {
+            const alive = (el) => {
+                try {
+                    if (!el) return false;
+                    if (typeof document.contains === 'function') return document.contains(el);
+                    return document.body.contains(el);
+                } catch (_) { return false; }
+            };
+            if (alive(input)) return input;
+            this.refreshCache();
+            return this.cachedInput;
         }
 
         _getInputValue(input) {
@@ -650,7 +778,8 @@
 
             this._enableButton(btn);
             this._clickElement(btn);
-            this._pressEnter(input);
+            // 1.1.18：不再点完立即补 Enter——抖音按钮点击通常有效，立即补发会双发
+            //         （实测严重）。失败场景由 send() 宽限轮询后的证据驱动兜底接管。
             return { success: true };
         }
 
@@ -666,12 +795,16 @@
             this._enableButton(btn);
             this._clickElement(btn);
             this._triggerReactHandlers(btn);
-            this._pressEnter(input);
+            // 1.1.18：同抖音，点完不立即补 Enter，失败由证据驱动兜底
             return { success: true };
         }
 
         async _sendBilibili(input) {
             await sleep(50);
+            // B 站：Enter 是主发送动作（无可靠按钮），直接发送。
+            // 1.1.19：发送后即使输入框未清空也不再补第二次 Enter——首发 Enter
+            //         很可能已生效只是清空慢，补发即双发（IS_ENTER_PRIMARY 在
+            //         send() 中拦截兜底分支）。
             this._pressEnter(input);
             return { success: true };
         }
@@ -683,9 +816,9 @@
 
             this._enableButton(btn);
             this._clickElement(btn);
-            // 修复：按钮点击可能因框架状态未同步而无响应（实测斗鱼 is-gray 灰态），
-            //      补 Enter 作为发送兜底（多数平台 Enter 与按钮等效）
-            this._pressEnter(input);
+            // 1.1.18：不再点完立即补 Enter（登录态按钮有效时会双发）。
+            // 斗鱼灰态/点击无效时，send() 的宽限轮询后凭「输入框未清空」证据补发
+            // Enter —— Enter 兜底能力完整保留，只是从「无条件」变成「有条件」
             return { success: true };
         }
 
@@ -715,10 +848,27 @@
             } catch (_) { /* 忽略 */ }
         }
 
+        /**
+         * 派发 Enter。
+         * 修复（1.1.19）：keyCode/which 写在 KeyboardEvent 构造参数里在部分内核会被
+         *   丢弃（二者是 legacy 只读属性），站点/jQuery 处理器判断 e.keyCode === 13
+         *   或 e.which === 13 时收到 0/undefined → Enter 兜底形同虚设（斗鱼灰态
+         *   按钮场景正是靠这条路径发得出去）。改为构造后用 defineProperty 强制
+         *   覆盖实例属性，保证任何读取方式都拿到 13。
+         * 注意：不派发 keypress——站点可能同时监听 keydown/keypress，会导致双发。
+         */
         _pressEnter(input) {
-            const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true };
-            input.dispatchEvent(new KeyboardEvent('keydown', opts));
-            input.dispatchEvent(new KeyboardEvent('keyup', opts));
+            for (const type of ['keydown', 'keyup']) {
+                try {
+                    const ev = new KeyboardEvent(type, {
+                        key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+                        keyCode: 13, which: 13,   // 部分内核支持构造参数，先给上
+                    });
+                    Object.defineProperty(ev, 'keyCode', { get: () => 13, configurable: true });
+                    Object.defineProperty(ev, 'which', { get: () => 13, configurable: true });
+                    input.dispatchEvent(ev);
+                } catch (_) { /* 忽略 */ }
+            }
         }
 
         _triggerReactHandlers(el) {
@@ -776,6 +926,10 @@
             // 弹幕监听
             danmuObserver: null,
             containerElement: null,
+            degradedToBody: false,  // 容器查找超时降级到 body：此后只认「像弹幕」的节点
+            // 1.1.19：让位/降级时可清理的周期定时器句柄
+            containerPollTimer: null,
+            blancWatchTimer: null,
             // DPM 统计
             timestamps: [],
             lastTsCleanup: 0,
@@ -793,14 +947,16 @@
     // 正则缓存：避免每次调用都重新编译 RegExp（P1-1 修复）
     const regexCache = new Map();
 
-    function cachedRegex(pattern) {
-        if (regexCache.has(pattern)) return regexCache.get(pattern);
+    function cachedRegex(pattern, flags) {
+        const f = flags || 'i';
+        const key = `${f} ${pattern}`;
+        if (regexCache.has(key)) return regexCache.get(key);
         try {
-            const re = new RegExp(pattern, 'i');
-            regexCache.set(pattern, re);
+            const re = new RegExp(pattern, f);
+            regexCache.set(key, re);
             return re;
         } catch (_) {
-            regexCache.set(pattern, null);
+            regexCache.set(key, null);
             return null;
         }
     }
@@ -843,7 +999,7 @@
             } else if (rule.type === 'not_contains') {
                 if (text.includes(rule.value)) return true;
             } else if (rule.type === 'regex') {
-                const re = cachedRegex(rule.value);
+                const re = cachedRegex(rule.value, rule.flags);
                 if (re && !re.test(text)) return true;
             }
         }
@@ -895,7 +1051,30 @@
     // =========================================================================
     // 模块 13：弹幕采集（MutationObserver）
     // =========================================================================
+    /**
+     * 降级模式下的「像弹幕」判定（1.1.19）。
+     * 容器查找超时后 observer 绑在 document.body 上，此时必须靠类名关键词
+     * 把弹幕节点从页面海量新增节点里筛出来，否则 DPM 会被无关节点灌满。
+     */
+    const DANMU_LIKE_SELECTOR = [
+        '[class*="danm"]', '[class*="danmu"]', '[class*="barrage"]', '[class*="chat"]',
+        '[class*="msg"]', '[class*="message"]', '[class*="comment"]', '[class*="bullet"]',
+    ].join(',');
+
+    function isDanmuLikeNode(node) {
+        try {
+            if (!node || node.nodeType !== 1 || !node.matches) return false;
+            if (node.matches(DANMU_LIKE_SELECTOR)) return true;
+            const p = node.parentElement || (node.parentNode && node.parentNode.nodeType === 1 ? node.parentNode : null);
+            return !!(p && p.matches && p.matches(DANMU_LIKE_SELECTOR));
+        } catch (_) {
+            return false;
+        }
+    }
+
     function startDanmuObserver(container) {
+        // 1.1.20：让位后禁止任何路径重新启动 observer
+        if (state.standDown) return;
         // 断开旧监听
         if (state.danmuObserver) {
             try { state.danmuObserver.disconnect(); } catch (_) { /* 忽略 */ }
@@ -950,6 +1129,11 @@
             }
 
             // 3) 无弹幕条目选择器/批量选择器失配时的兜底：按节点文本处理
+            //    1.1.19：降级到 body 时，页面任何新增节点（按钮文案、时间戳、
+            //    礼物条……）都会走到这里被当成弹幕 → 垃圾入池 + DPM 虚高（误判
+            //    疯狂模式）。降级模式只接受「像弹幕」的节点（类名/父级类名含
+            //    danmu/chat/msg/barrage 等关键词）。
+            if (state.degradedToBody && !isDanmuLikeNode(node)) return false;
             return captureOne(node, '捕获');
         };
 
@@ -1240,6 +1424,11 @@
                 state.retryCount++;
                 state.lastRetryTime = now;
                 await sendMessage(state.pendingMsg);
+                // 1.1.20：重试成功后立即刷新「下次」预览，避免继续显示刚发出的 pending
+                if (!state.pendingMsg) {
+                    const nextCandidates = getWeightedCandidates();
+                    state.nextPreviewMsg = nextCandidates[0]?.text || '';
+                }
             } else if (state.retryCount >= TIMING.RETRY_MAX_ATTEMPTS || !retryable) {
                 if (!retryable) {
                     Logger.warn('烂梗机', `SEND_FAILED 不重试（可能已发出），丢弃: ${state.pendingMsg}`);
@@ -1346,7 +1535,10 @@
         state.pendingMsg = null;
         state.retryCount = 0;
         state.lastRetryTime = 0;
-        state.isSending = false;
+        // 1.1.20：不要在这里强制清 isSending。飞行中的 sendMessage 结束时会再清一次，
+        // 快速关→开会把新发送的 busy 标志误清掉，造成并发发送；保留该标志让旧发送
+        // 自然结束后再恢复调度即可。
+        // state.isSending = false;
 
         updateUIDisplay(getMessagesPerMinute());
         Logger.info('烂梗机', '机器人已停止');
@@ -1359,18 +1551,32 @@
      *      候选数冻结在关闭前的值。打开开关时必须重新启动监听。
      */
     function ensureObserverRunning() {
+        if (state.standDown) return;      // 已让位：不再恢复监听
         if (state.danmuObserver) return; // 已在监听中
 
-        const container = parser.findContainer();
-        // 修复：findContainer 现在找不到时返回 null —— 容器未就绪时不启动监听，
-        //      由 startContainerPolling 继续轮询接管（避免对 null 启动 observer）
-        if (!container) {
-            Logger.debug('烂梗机', '容器未就绪，等待轮询接管');
+        // 1.1.20：优先重新探测真实容器；若此前已经降级到 body，则恢复 body 监听。
+        // 旧实现只调用 parser.findContainer()，body 降级后轮询已经结束，
+        // 用户关掉再打开开关时 findContainer() 返回 null → 永久不再采集。
+        let container = null;
+        try {
+            container = parser.findContainer();
+        } catch (e) {
+            logError('ensureObserverRunning.findContainer', e);
+        }
+        if (container) {
+            state.degradedToBody = false;
+            state.containerElement = container;
+            startDanmuObserver(container);
+            Logger.info('烂梗机', '弹幕监听已重新启动');
             return;
         }
-        state.containerElement = container;
-        startDanmuObserver(container);
-        Logger.info('烂梗机', '弹幕监听已重新启动');
+        if (state.degradedToBody && document.body) {
+            state.containerElement = document.body;
+            startDanmuObserver(document.body);
+            Logger.info('烂梗机', '弹幕监听已重新启动（body 降级模式）');
+            return;
+        }
+        Logger.debug('烂梗机', '容器未就绪，等待轮询接管');
     }
 
     // =========================================================================
@@ -1466,6 +1672,13 @@
                 const val = parseInt(raw, 10);
                 return isNaN(val) ? null : { type, op, value: val };
             }
+            // 1.1.19：regex 支持 /xxx/ 字面量写法——设置页提示就是 regex:/^\d+$/，
+            //         旧实现把斜杠当成正则内容，永远匹配不上 → 规则「过滤一切」，
+            //         用户按提示填完后机器人直接不再发弹幕
+            if (type === 'regex') {
+                const m = /^\/([\s\S]+)\/([gimsuy]*)$/.exec(raw);
+                return { type, value: m ? m[1] : raw, flags: m && m[2] ? m[2] : 'i' };
+            }
             return { type, value: raw };
         }
         return null;
@@ -1476,7 +1689,8 @@
             if (r.type === 'length') return `length${r.op}${r.value}`;
             if (r.type === 'contains') return `contains:${r.value}`;
             if (r.type === 'not_contains') return `not_contains:${r.value}`;
-            if (r.type === 'regex') return `regex:${r.value}`;
+            // 1.1.19：统一以 /xxx/flags 字面量回显，保证「显示→保存」可往返
+            if (r.type === 'regex') return `regex:/${r.value}/${r.flags || 'i'}`;
             return '';
         }).filter(Boolean).join('\n');
     }
@@ -1515,7 +1729,11 @@
     // =========================================================================
     // 模块 19：UI - 样式注入
     // =========================================================================
+    let stylesInjected = false;   // 1.1.19：面板可能重建，样式只注入一次
+
     function injectStyles() {
+        if (stylesInjected) return;
+        stylesInjected = true;
         GM_addStyle(`
 :root {
     --bot-bg: #1a1a2e;
@@ -1599,7 +1817,8 @@
 .bot-slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: #ccc; transition: .3s; border-radius: 50%; }
 input:checked + .bot-slider { background-color: var(--bot-accent); }
 input:checked + .bot-slider:before { transform: translateX(20px); background-color: #fff; }
-#bot-panel.bot-panel-fshidden { display: none !important; }
+/* 全屏隐藏：类名通用化，设置浮层（#bot-settings-overlay）同样适用 */
+.bot-panel-fshidden { display: none !important; }
 `);
     }
 
@@ -1684,8 +1903,12 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
     /** 面板位置视口 clamp：确保 left/top 不超出可视区域（分辨率/窗口变化后不会跑出屏幕外） */
     function clampPanelPos(panel, left, top) {
         const margin = 8;
-        const maxLeft = Math.max(margin, window.innerWidth - panel.offsetWidth - margin);
-        const maxTop = Math.max(margin, window.innerHeight - panel.offsetHeight - margin);
+        // 1.1.19：折叠态量到的高度只有 header 高，按它 clamp 后一展开面板就顶出
+        //         视口下沿（开关点不到）。按「展开后」的高度预留。
+        const estH = Math.max(panel.offsetHeight || 0, 240);
+        const estW = panel.offsetWidth || 240;
+        const maxLeft = Math.max(margin, window.innerWidth - estW - margin);
+        const maxTop = Math.max(margin, window.innerHeight - estH - margin);
         const cl = Math.min(Math.max(margin, left), maxLeft);
         const ct = Math.min(Math.max(margin, top), maxTop);
         return { left: cl + 'px', top: ct + 'px' };
@@ -1731,6 +1954,10 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
 
         const onPointerMove = (e) => {
             if (pointerId === null || e.pointerId !== pointerId) return;
+            // 1.1.19：setPointerCapture 失败时收不到 pointerup → 按键松开后仍在
+            //         拖动状态（「幽灵拖动」）。仅在已判定为拖动时收尾，避免
+            //         把一次普通点击误判成折叠切换
+            if (isDragging && e.buttons === 0) { finishDrag(e); return; }
             deltaX = e.clientX - startX;
             deltaY = e.clientY - startY;
             if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) isDragging = true;
@@ -1766,6 +1993,8 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
         header.addEventListener('pointermove', onPointerMove);
         header.addEventListener('pointerup', finishDrag);
         header.addEventListener('pointercancel', finishDrag);
+        // 1.1.19：捕获被系统收回（元素移除/隐藏/浏览器中断）时同样收尾
+        header.addEventListener('lostpointercapture', finishDrag);
     }
 
     function loadPanelPosition() {
@@ -1793,7 +2022,9 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
             const modeEl = $('bot-status-mode');
             if (!modeEl) return;
 
-            const hasError = Logger.getErrors().length > 0;
+            // 修复：只统计最近 2 分钟的错误——旧实现用 Logger.getErrors() 全量，
+            //      一条历史 error 会让面板模式永久显示「错误」
+            const hasError = Logger.getRecentErrors().length > 0;
             const displayMode = hasError ? '错误' : state.currentMode;
 
             modeEl.textContent = displayMode;
@@ -1945,8 +2176,16 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = `bot_log_${Date.now()}.log`;
+        // 1.1.19：游离 <a> 在部分浏览器（Firefox 及部分 Chromium 版本）不触发下载，
+        //         且 click 后立即 revoke 会抢在下载开始前撤销 URL → 导出空文件/无反应。
+        //         改为挂到文档再点击，延迟撤销并移除节点。
+        a.style.display = 'none';
+        document.body.appendChild(a);
         a.click();
-        URL.revokeObjectURL(a.href);
+        setTimeout(() => {
+            try { URL.revokeObjectURL(a.href); } catch (_) { /* 忽略 */ }
+            try { a.remove(); } catch (_) { /* 忽略 */ }
+        }, 1000);
     }
 
     // =========================================================================
@@ -2032,7 +2271,7 @@ ${buildDebugSection()}
         return `
 <div class="row" style="display:flex;align-items:center;margin-bottom:4px;gap:6px;flex-wrap:wrap;">
   <label style="width:80px;font-size:var(--bot-font-size,12px);color:var(--bot-text,#aaa);flex-shrink:0;">${label}</label>
-  <input type="number" id="${id}" value="${value}" ${minAttr} ${maxAttr} ${stepAttr}
+  <input type="number" id="${id}" value="${escapeHtml(value ?? '')}" ${minAttr} ${maxAttr} ${stepAttr}
     style="background:var(--bot-border,rgba(255,255,255,0.06));border:1px solid var(--bot-border,rgba(255,255,255,0.12));color:var(--bot-text,#eee);border-radius:4px;padding:3px 5px;font-size:var(--bot-font-size,12px);flex:1;min-width:50px;">
 </div>`;
     }
@@ -2054,11 +2293,11 @@ ${buildDebugSection()}
   ${buildInputRow('s-opacity', '透明度', theme.opacity, 0.5, 1, '0.05')}
   <div class="row" style="display:flex;align-items:center;margin-bottom:4px;gap:6px;flex-wrap:wrap;">
     <label style="width:80px;font-size:var(--bot-font-size,12px);color:var(--bot-text,#aaa);flex-shrink:0;">字体大小</label>
-    <input type="text" id="s-fontSize" value="${theme.fontSize}" style="background:var(--bot-border,rgba(255,255,255,0.06));border:1px solid var(--bot-border,rgba(255,255,255,0.12));color:var(--bot-text,#eee);border-radius:4px;padding:3px 5px;font-size:var(--bot-font-size,12px);flex:1;min-width:50px;">
+    <input type="text" id="s-fontSize" value="${escapeHtml(theme.fontSize ?? '')}" style="background:var(--bot-border,rgba(255,255,255,0.06));border:1px solid var(--bot-border,rgba(255,255,255,0.12));color:var(--bot-text,#eee);border-radius:4px;padding:3px 5px;font-size:var(--bot-font-size,12px);flex:1;min-width:50px;">
   </div>
   <div class="row" style="display:flex;align-items:center;margin-bottom:4px;gap:6px;flex-wrap:wrap;">
     <label style="width:80px;font-size:var(--bot-font-size,12px);color:var(--bot-text,#aaa);flex-shrink:0;">圆角</label>
-    <input type="text" id="s-borderRadius" value="${theme.borderRadius}" style="background:var(--bot-border,rgba(255,255,255,0.06));border:1px solid var(--bot-border,rgba(255,255,255,0.12));color:var(--bot-text,#eee);border-radius:4px;padding:3px 5px;font-size:var(--bot-font-size,12px);flex:1;min-width:50px;">
+    <input type="text" id="s-borderRadius" value="${escapeHtml(theme.borderRadius ?? '')}" style="background:var(--bot-border,rgba(255,255,255,0.06));border:1px solid var(--bot-border,rgba(255,255,255,0.12));color:var(--bot-text,#eee);border-radius:4px;padding:3px 5px;font-size:var(--bot-font-size,12px);flex:1;min-width:50px;">
   </div>
 `);
     }
@@ -2067,7 +2306,7 @@ ${buildDebugSection()}
         return `
 <div class="row" style="display:flex;align-items:center;margin-bottom:4px;gap:6px;flex-wrap:wrap;">
   <label style="width:80px;font-size:var(--bot-font-size,12px);color:var(--bot-text,#aaa);flex-shrink:0;">${label}</label>
-  <input type="color" id="${id}" value="${value}" style="background:#fff;border:2px solid var(--bot-accent,#ff9800);border-radius:4px;padding:2px;width:40px;height:40px;cursor:pointer;">
+  <input type="color" id="${id}" value="${escapeHtml(value ?? '')}" style="background:#fff;border:2px solid var(--bot-accent,#ff9800);border-radius:4px;padding:2px;width:40px;height:40px;cursor:pointer;">
 </div>`;
     }
 
@@ -2133,12 +2372,16 @@ ${buildDebugSection()}
         state.priorityWords = priorityWords;
 
         // 主题
+        // 修复：opacity 清空时保持原值——旧实现 getNum 直接落盘，NaN 未被
+        //      numConfig 循环的跳过覆盖，导致 --bot-opacity: NaN 面板透明
+        const prevTheme = state.config.theme || DEFAULT_THEME;
+        const rawOpacity = getNum('s-opacity');
         const theme = {
             bgColor: getVal('s-bgColor'),
             textColor: getVal('s-textColor'),
             accentColor: getVal('s-accentColor'),
             borderColor: getVal('s-borderColor'),
-            opacity: getNum('s-opacity'),
+            opacity: Number.isNaN(rawOpacity) ? (prevTheme.opacity ?? DEFAULT_THEME.opacity) : rawOpacity,
             fontSize: getVal('s-fontSize') || '12px',
             borderRadius: getVal('s-borderRadius') || '10px',
         };
@@ -2233,6 +2476,27 @@ ${buildDebugSection()}
     const parser = new PlatformParser(PLATFORM, probe);
     const sender = new PlatformSender(PLATFORM, parser);
 
+    /**
+     * 面板存活保障（1.1.19）。
+     * 问题：直播页 SPA 路由/整块 DOM 重写会把 #bot-panel 直接抹掉，旧实现此后
+     *      只是静默空转——机器人仍在发弹幕，但用户没有任何 UI 可以关掉它。
+     * 修复：1s 周期任务里检查面板是否存在，缺失则重建并同步开关/位置/全屏态。
+     */
+    function ensurePanelAlive() {
+        if (state.standDown) return;
+        if ($('bot-panel')) return;
+        try {
+            createMainPanel();
+            loadPanelPosition();
+            const toggle = $('bot-toggle-switch');
+            if (toggle) toggle.checked = !!state.isRunning;
+            if (fullscreenController) fullscreenController.reset();
+            Logger.info('烂梗机', '面板被页面移除，已重建');
+        } catch (e) {
+            logError('面板重建', e);
+        }
+    }
+
     function init() {
         Logger.info('烂梗机', `初始化 v${SCRIPT_VERSION} | 平台: ${PLATFORM}`);
 
@@ -2244,20 +2508,71 @@ ${buildDebugSection()}
         parser.refreshSelectors();
 
         startContainerPolling();
+        startBlancYieldWatch();
         startPeriodicTasks();
         startFullscreenDetection();
         startVisibilityHandler();
+    }
+
+    /**
+     * 主文档让位给 blanc iframe 实例（净化退出，1.1.18 独立成函数）。
+     * 让位后本实例彻底空转：面板移除、observer 断开、调度/倒计时清空，
+     * 周期任务凭 standDown 短路，不再尝试任何恢复（P0-2 by design：不重连）。
+     */
+    function yieldToBlancFrame(reason) {
+        if (state.standDown) return;
+        state.standDown = true;
+        state.isRunning = false;
+        if (state.danmuObserver) {
+            try { state.danmuObserver.disconnect(); } catch (_) { /* 忽略 */ }
+            state.danmuObserver = null;
+        }
+        if (state.mainTimer) { clearTimeout(state.mainTimer); state.mainTimer = null; }
+        if (state.countdownTimer) { clearInterval(state.countdownTimer); state.countdownTimer = null; }
+        // 1.1.19：让位后容器轮询与 blanc 监听也要停——它们原本只靠 standDown
+        //         短路空转，定时器永久存活（每页面两个常驻 interval）
+        if (state.containerPollTimer) { clearInterval(state.containerPollTimer); state.containerPollTimer = null; }
+        if (state.blancWatchTimer) { clearInterval(state.blancWatchTimer); state.blancWatchTimer = null; }
+        const idlePanel = document.getElementById('bot-panel');
+        if (idlePanel) idlePanel.remove();
+        Logger.info('烂梗机', `检测到 blanc iframe（${reason}），主文档让位给 iframe 实例`);
+    }
+
+    /**
+     * B 站 blanc 让位独立周期检查（1.1.18）。
+     * 修复：1.1.17 的让位检查写在容器轮询内——若主文档先命中容器（A 类房间之外
+     *       的主文档恰有可匹配容器），clearInterval 后让位检查永不触发。
+     *       改为独立 1s 检查，覆盖任意时刻（含 45s body 降级后）晚插入的 blanc。
+     */
+    function startBlancYieldWatch() {
+        if (PLATFORM !== 'bilibili' || !IS_TOP_FRAME) return;
+        state.blancWatchTimer = setInterval(() => {
+            try {
+                if (state.standDown) return;
+                if (document.querySelector('iframe[src*="/blanc/"]')) {
+                    yieldToBlancFrame('周期检查');
+                }
+            } catch (_) { /* 忽略 */ }
+        }, TIMING.UI_UPDATE_INTERVAL);
     }
 
     /** 轮询查找弹幕容器（按设计：找到后不再重连） */
     function startContainerPolling() {
         let poll = 0;
         const tryFind = setInterval(() => {
+            // 1.1.20：让位后立即停止轮询，避免晚到容器重新启动 observer
+            if (state.standDown) {
+                clearInterval(tryFind);
+                state.containerPollTimer = null;
+                return;
+            }
             poll++;
             try {
                 const container = parser.findContainer();
                 if (container) {
                     clearInterval(tryFind);
+                    state.containerPollTimer = null;
+                    state.degradedToBody = false;
                     state.containerElement = container;
                     // 修复：若用户已提前打开开关（ensureObserverRunning 已启动监听），
                     // 不可重复 startDanmuObserver——它会 freqMap.clear() 清空已采集数据，
@@ -2270,29 +2585,20 @@ ${buildDebugSection()}
                     }
                     return;
                 }
-                // 1.1.17：B 站 blanc 让位检查（置于 body 降级之前）——一旦检测到
-                // blanc iframe，主文档实例净化退出：移除面板、断开 observer、
-                // 周期任务空转（standDown），由 blanc iframe 实例接管采集。
-                // 顺序提前确保 blanc 晚于 45s 轮询窗口出现时同样生效。
+                // 1.1.17 遗留的轮询内让位检查由独立 startBlancYieldWatch 接管
+                // （1.1.18：此处仅做一处快速兜底，防止 watch 启动前的窗口期）
                 if (PLATFORM === 'bilibili'
                     && document.querySelector('iframe[src*="/blanc/"]')) {
                     clearInterval(tryFind);
-                    state.standDown = true;
-                    state.isRunning = false;
-                    if (state.danmuObserver) {
-                        try { state.danmuObserver.disconnect(); } catch (_) { /* 忽略 */ }
-                        state.danmuObserver = null;
-                    }
-                    if (state.mainTimer) { clearTimeout(state.mainTimer); state.mainTimer = null; }
-                    if (state.countdownTimer) { clearInterval(state.countdownTimer); state.countdownTimer = null; }
-                    const idlePanel = document.getElementById('bot-panel');
-                    if (idlePanel) idlePanel.remove();
-                    Logger.debug('烂梗机', '检测到 blanc iframe，主文档让位给 iframe 实例（面板已移除）');
+                    state.containerPollTimer = null;
+                    yieldToBlancFrame('容器轮询');
                     return;
                 }
                 if (poll >= TIMING.CONTAINER_POLL_MAX) {
                     clearInterval(tryFind);
-                    Logger.warn('烂梗机', '弹幕容器查找超时，监听整个文档');
+                    state.containerPollTimer = null;
+                    Logger.warn('烂梗机', '弹幕容器查找超时，监听整个文档（仅采集类弹幕节点）');
+                    state.degradedToBody = true;   // 1.1.19：降级标志，供 handleNode 过滤
                     state.containerElement = document.body;
                     if (!state.danmuObserver) {
                         startDanmuObserver(document.body);
@@ -2302,6 +2608,7 @@ ${buildDebugSection()}
                 logError('容器查找', e);
             }
         }, TIMING.CONTAINER_POLL_INTERVAL);
+        state.containerPollTimer = tryFind;   // 1.1.19：让位时可清理
     }
 
     /** 启动周期性任务 */
@@ -2316,6 +2623,7 @@ ${buildDebugSection()}
         // UI 更新与配置同步（1s）
         setInterval(() => {
             if (state.standDown) return; // 让位后空转：不刷新面板/不重启调度
+            ensurePanelAlive();          // 1.1.19：面板被页面抹掉后重建
             checkConfigUpdate();
             if (state.isRunning) switchMode();
             const candidates = getWeightedCandidates();
@@ -2332,20 +2640,173 @@ ${buildDebugSection()}
         }, 30000);
     }
 
-    /** 全屏时隐藏面板 */
+    // =========================================================================
+    // 模块 28：全屏检测（1.1.19 重写）
+    //
+    // 背景（真机反馈）：「网页全屏」是站点自绘状态，不走 Fullscreen API，
+    //   document.fullscreenElement 恒为 null；1.1.18 只认 body.player-fullscreen
+    //   与 B 站 .layout-Player-barrageStage.fullscreen 两个标记 → 斗鱼/虎牙/抖音
+    //   网页全屏全都漏判，面板不隐藏。
+    // 策略：四路信号取或，宁可多判也不能漏判；但几何兜底按平台开关，避免
+    //   抖音直播（常态即满屏视频）被永久误判而丢面板。
+    // =========================================================================
+
+    /** ① html/body 上的全屏类名关键字 */
+    const FS_CLASS_RE = /full-?screen|web-?full|cssfullscreen|player-?full|(\b|-)wfs(\b|-)/i;
+
+    /** ② 各平台「网页全屏」已知 DOM 标记 */
+    const FS_SELECTORS = [
+        '.layout-Player-barrageStage.fullscreen',      // B 站直播（旧版）
+        '.layout-Player-videoWrap.fullscreen',         // B 站直播
+        '.web-player-fullscreen',                      // 斗鱼 / B 站
+        '.player-fullscreen',                          // 斗鱼
+        '.huya-player-fullscreen',                     // 虎牙
+        '#J_videoWrap.fullscreen',                     // 虎牙
+        '.webcast-fullscreen',                         // 抖音
+        '.video-fullscreen',                           // 通用
+        '.xgplayer.is-fullscreen',                     // 西瓜/xgplayer 真全屏
+        '.xgplayer.is-cssfullscreen',                  // xgplayer 网页全屏
+        '.bilibili-player-video-wrap.fullscreen',      // B 站播放器
+        '.live-player-ctnr.fullscreen',                // B 站直播新版
+        '[data-fullscreen="true"]',                    // 属性型标记
+    ];
+
+    /** ③ 几何兜底适用平台（抖音直播常态即满屏 → 排除，否则面板永久消失） */
+    const FS_GEOMETRY_PLATFORMS = { douyu: true, huya: true, bilibili: true };
+
+    /** 原生全屏元素（兼容 webkit / moz / ms 前缀） */
+    function getNativeFullscreenElement(doc) {
+        return doc.fullscreenElement || doc.webkitFullscreenElement
+            || doc.webkitCurrentFullScreenElement || doc.mozFullScreenElement
+            || doc.msFullscreenElement || null;
+    }
+
+    /** html/body 类名命中全屏关键字 */
+    function hasFullscreenClass(doc) {
+        const roots = [doc.documentElement, doc.body];
+        for (let i = 0; i < roots.length; i++) {
+            const el = roots[i];
+            if (!el) continue;
+            const cls = typeof el.className === 'string' ? el.className : '';
+            if (cls && FS_CLASS_RE.test(cls)) return true;
+        }
+        return false;
+    }
+
+    /** 已知平台容器标记命中 */
+    function hasFullscreenMarker(doc) {
+        for (let i = 0; i < FS_SELECTORS.length; i++) {
+            try { if (doc.querySelector(FS_SELECTORS[i])) return true; }
+            catch (_) { /* 选择器异常忽略 */ }
+        }
+        return false;
+    }
+
+    /** 视频铺满视口（网页全屏的通用几何特征） */
+    function isVideoCoveringViewport(win, doc) {
+        if (!FS_GEOMETRY_PLATFORMS[PLATFORM]) return false;
+        const vw = win.innerWidth, vh = win.innerHeight;
+        if (!vw || !vh) return false;
+        let videos;
+        try { videos = doc.querySelectorAll('video'); } catch (_) { return false; }
+        for (let i = 0; i < videos.length; i++) {
+            let r = null;
+            try { r = videos[i].getBoundingClientRect(); } catch (_) { continue; }
+            if (!r || r.width <= 0 || r.height <= 0) continue;
+            if (r.width >= vw * 0.92 && r.height >= vh * 0.92) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 综合判定当前是否全屏（真全屏或网页全屏）。
+     * @returns {string|null} 命中原因（可直接写进日志排查误判），未全屏返回 null
+     * B 站 blanc iframe 实例：iframe 自身不含播放器，需检查同域父文档。
+     */
+    function detectFullscreen() {
+        try {
+            if (getNativeFullscreenElement(document)) return '原生全屏';
+            if (hasFullscreenClass(document)) return 'html/body 全屏类名';
+            if (hasFullscreenMarker(document)) return '平台全屏容器标记';
+            if (isVideoCoveringViewport(window, document)) return '视频铺满视口';
+            if (!IS_TOP_FRAME) {
+                try {
+                    const pwin = window.parent;
+                    const pdoc = pwin && pwin.document;
+                    if (pdoc) {
+                        if (getNativeFullscreenElement(pdoc)) return '父文档原生全屏';
+                        if (hasFullscreenClass(pdoc)) return '父文档全屏类名';
+                        if (hasFullscreenMarker(pdoc)) return '父文档全屏容器标记';
+                        if (isVideoCoveringViewport(pwin, pdoc)) return '父文档视频铺满视口';
+                    }
+                } catch (_) { /* 跨域父文档忽略 */ }
+            }
+        } catch (_) { /* 忽略 */ }
+        return null;
+    }
+
+    /** 全屏控制器句柄：面板重建后需要强制重算一次（新建的面板不带隐藏类） */
+    let fullscreenController = null;
+
+    /** 全屏时隐藏面板（含设置浮层） */
     function startFullscreenDetection() {
-        const updateFullscreen = () => {
+        let lastState = null;
+        let lastRun = 0;
+
+        const apply = () => {
             try {
                 const panel = $('bot-panel');
                 if (!panel) return;
-                const isFullscreen = !!document.fullscreenElement
-                    || document.body.classList.contains('player-fullscreen')
-                    || !!document.querySelector('.layout-Player-barrageStage.fullscreen');
-                panel.classList.toggle('bot-panel-fshidden', isFullscreen);
+                const reason = detectFullscreen();
+                const isFs = !!reason;
+                if (isFs === lastState) return;   // 状态未变：不重复写 DOM
+                lastState = isFs;
+                // 记录命中原因：万一某站点误判（面板莫名消失），控制台可直接定位
+                if (isFs) Logger.info('烂梗机', `检测到全屏（${reason}），已隐藏面板`);
+                panel.classList.toggle('bot-panel-fshidden', isFs);
+                // 设置浮层 z-index 100000，不隐藏会盖在网页全屏画面上
+                const overlay = $('bot-settings-overlay');
+                if (overlay) overlay.classList.toggle('bot-panel-fshidden', isFs);
             } catch (_) { /* 忽略 */ }
         };
-        document.addEventListener('fullscreenchange', updateFullscreen);
-        setInterval(updateFullscreen, 1500);
+
+        // 高频源（class 变更/全屏事件）做 300ms 节流，避免站点频繁改 body 类名时
+        // 反复跑 13 条选择器 + 几何计算；漏掉的最终由 1s 兜底轮询补齐
+        const throttled = () => {
+            const now = Date.now();
+            if (now - lastRun < 300) return;
+            lastRun = now;
+            apply();
+        };
+
+        // 真全屏：标准 + 前缀事件
+        ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange']
+            .forEach(ev => document.addEventListener(ev, throttled, true));
+
+        // 网页全屏：无事件，只能观察 html/body class 变化（各平台都是加类名实现）
+        const mo = new MutationObserver(throttled);
+        try {
+            mo.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+            if (document.body) mo.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+        } catch (_) { /* 忽略 */ }
+
+        fullscreenController = {
+            apply,
+            // 面板被重建后调用：清掉去重状态，强制把当前全屏态写回新面板
+            reset: () => { lastState = null; apply(); },
+        };
+
+        // 兜底轮询：覆盖不触发 class 变更的实现（如只改 style / 换容器）
+        const timer = setInterval(() => {
+            if (state.standDown) {          // 让位后不再空转
+                clearInterval(timer);
+                try { mo.disconnect(); } catch (_) { /* 忽略 */ }
+                return;
+            }
+            apply();
+        }, TIMING.UI_UPDATE_INTERVAL);
+
+        apply();
     }
 
     /** 页面恢复可见时刷新数据 */
