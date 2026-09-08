@@ -3673,10 +3673,10 @@ ${buildDebugSection()}
     try { return (window.top && window.top.location && window.top.location.href) || ''; } catch (_e) { /* 跨域 */ }
     try { return document.referrer || ''; } catch (_e2) { return ''; }
   }
-  function biliRoom() { return parseBiliRoomId(location.href, safeTopHref()); }
-  function isBiliPage() { return location.hostname.indexOf('bilibili.com') >= 0 && biliRoom() > 0; }
+  function __DEF_PROTECT___lgjResolveRoom() { return parseBiliRoomId(location.href, safeTopHref()); }
+  function __DEF_PROTECT___lgjProtoPlatform() { return location.hostname.indexOf('bilibili.com') >= 0 && __lgjResolveRoom() > 0; }
   /** 多标签选举的 key：同房间的不同文档（含 blanc iframe）必须一致 */
-  function roomKey() { return biliRoom() || location.pathname.replace(/[^0-9]/g, '') || location.hostname; }
+  function roomKey() { return __lgjResolveRoom() || location.pathname.replace(/[^0-9]/g, '') || location.hostname; }
 
   function BiliSource(roomId, onDanmu, onDrop, onAuth) {
     this.roomId = roomId;          // URL 里的房间号（可能是短号）
@@ -3872,10 +3872,10 @@ ${buildDebugSection()}
   // 只做 B 站；返回 null 表示「不适用 / 未登录」→ 由 __lgjSend 回落 DOM。
   // 平台明确拒绝或网络异常时绝不回落，避免「请求已到达但响应异常」时双发。
   function protocolSend(text) {
-    if (!isBiliPage()) return Promise.resolve(null);
+    if (!__lgjProtoPlatform()) return Promise.resolve(null);
     var csrf = readCookie('bili_jct');
     if (!csrf) return Promise.resolve(null);
-    var room = biliRoom();
+    var room = __lgjResolveRoom();
     return resolveRealRoomId(room).then(function (realRoom) {
       if (!realRoom) return null;
       var body = 'bubble=0&msg=' + encodeURIComponent(text)
@@ -4018,8 +4018,10 @@ ${buildDebugSection()}
   }
   /** 连接协议；auth 成功才 domPause + engaged，失败/掉线立即回 DOM（无数据空窗） */
   function engageProto() {
-    var room = biliRoom();
-    if (!room || !isBiliPage()) { setStatus('协议：仅 B 站直播间可用', 'err'); return Promise.resolve(false); }
+    if (__lgjEngaging) return Promise.resolve(false);
+    __lgjEngaging = true;
+    var room = __lgjResolveRoom();
+    if (!room || !__lgjProtoPlatform()) { __lgjEngaging = false; setStatus('协议：仅 B 站直播间可用', 'err'); return Promise.resolve(false); }
     stopProtocol();
     setStatus('协议：连接中…', '');
     logEvent('协议', '连接中（房间 ' + room + '）');
@@ -4031,11 +4033,13 @@ ${buildDebugSection()}
       engaged = true;
     });
     return src.start().then(function () {
+      __lgjEngaging = false;
       protoFailUntil = 0;
       setStatus('协议：数据流', 'ok');
       logEvent('协议', '已接管（真实房号 ' + ((src && src.realRoomId) || room) + '）');
       return true;
     }).catch(function (e) {
+      __lgjEngaging = false;
       engaged = false;
       stopProtocol();
       domResume();
@@ -4074,10 +4078,10 @@ ${buildDebugSection()}
     if (!started) return;
     var running = !!(state && state.isRunning);
     // 计算「智能模式是否不可用」：非 B 站 / 探测失败退避中 → 一级界面显示手动开关
-    autoUnavailable = (mode === 'auto') && (!isBiliPage() || Date.now() < protoFailUntil);
+    autoUnavailable = (mode === 'auto') && (!__lgjProtoPlatform() || Date.now() < protoFailUntil);
     if (autoUnavailable && !_autoWarned) {
       _autoWarned = true;
-      logEvent('引擎', '智能模式不可用（' + (!isBiliPage() ? '该平台暂无协议源' : '协议探测失败/退避中') + '），一级界面已显示手动开关');
+      logEvent('引擎', '智能模式不可用（' + (!__lgjProtoPlatform() ? '该平台暂无协议源' : '协议探测失败/退避中') + '），一级界面已显示手动开关');
     }
     if (!autoUnavailable) _autoWarned = false;
     refreshEngineControls();
@@ -4089,7 +4093,7 @@ ${buildDebugSection()}
     }
     if (!running) {
       if (engaged || src) disengageProto();
-      else if (mode !== 'dom' && isBiliPage()) setStatus('待机：请打开机器人开关', '');
+      else if (mode !== 'dom' && __lgjProtoPlatform()) setStatus('待机：请打开机器人开关', '');
       return;
     }
     if (mode === 'dom') {
@@ -4098,7 +4102,7 @@ ${buildDebugSection()}
       return;
     }
     if (engaged) return;
-    if (!isBiliPage()) {
+    if (!__lgjProtoPlatform()) {
       setStatus('DOM 采集（该平台暂无协议源）', 'ok');
       protoFailUntil = Date.now() + 60000;
       return;
@@ -4238,7 +4242,7 @@ ${buildDebugSection()}
     }
     topMeta.sort(function (a, b) { return b.count - a.count; });
     return {
-      platform: _plat(), room: biliRoom() || location.pathname.replace(/[^0-9]/g, ''),
+      platform: _plat(), room: __lgjResolveRoom() || location.pathname.replace(/[^0-9]/g, ''),
       engine: mode, sendMode: sendMode, engineStatus: statusEl ? statusEl.textContent : '',
       sourceKind: window.__lgjSourceKind || '', engaged: engaged, protoFailUntil: protoFailUntil,
       leader: election ? (election.isLeader() ? 'leader' : 'follower') : 'solo',
@@ -4533,6 +4537,190 @@ ${buildDebugSection()}
   };
   window.__lgjSourceKind = 'dom';
 
+
+    // ============ 1.2.0-P2 平台协议扩展 + UI 增强（追加于生产 hybrid IIFE 内）============
+    // 与生产 hybrid 同作用域：复用 mode/engaged/feedProtocol/onProtocolDrop/domPause/
+    // isBiliPage/biliRoom/state/safety 等符号。
+    // 平台协议能力（2026-09-09 真机校准后收敛）：
+    //   B站：自连 comet wss —— 保留（真机验证可用）
+    //   斗鱼：danmuproxy 帧级实现 auth-timeout（真机不可用）→ 禁用，走 DOM
+    //   虎牙：需 ws.Launch 会话（真机遗留未闭环）→ DOM
+    //   抖音：im 签名仅页面 SDK 可产（沙箱不可行）→ DOM
+    // 任何失败/不可用平台均由 engageProto catch 回落 DOM（安全兜底）。
+  
+    function __lgjHost() {
+      try {
+        var h = location.hostname;
+        if (h.indexOf('douyu.com') >= 0) return 'douyu';
+        if (h.indexOf('huya.com') >= 0) return 'huya';
+        if (h.indexOf('bilibili.com') >= 0) return 'bilibili';
+        if (h.indexOf('douyin.com') >= 0) return 'douyin';
+      } catch (_e) { /* 忽略 */ }
+      return '';
+    }
+    function __lgjIsBili() { try { return isBiliPage(); } catch (_e) { return false; } }
+    /** 该平台是否有沙箱可直连的协议源（斗鱼帧级实现真机 auth-timeout 已下线；虎牙/抖音需页面 hook） */
+    var __lgjEngaging = false; // engage 进行中互斥锁（防每 2s 重复并发连协议）
+    function __lgjProtoPlatform() {
+      var h = __lgjHost();
+      return h === 'bilibili';
+    }
+    function __lgjPlatformName() {
+      var names = { bilibili: 'B站', douyu: '斗鱼', huya: '虎牙', douyin: '抖音' };
+      return names[__lgjHost()] || __lgjHost() || '未知';
+    }
+    function __lgjResolveRoom() {
+      if (__lgjIsBili()) { try { return biliRoom() || 0; } catch (_e) { return 0; } }
+      try {
+        var m = /^\/(\d+)/.exec(location.pathname);
+        if (m) return parseInt(m[1], 10);
+        m = /[?&]rid=(\d+)/.exec(location.search);
+        if (m) return parseInt(m[1], 10);
+      } catch (_e) { /* 忽略 */ }
+      return 0;
+    }
+    function __lgjBuildSource(room, onDanmu, onDrop, onAuth) {
+      var h = __lgjHost();
+      if (h === 'bilibili') return new BiliSource(room, onDanmu, onDrop, onAuth);
+      if (h === 'douyu') return new DouyuSource(room, onDanmu, onDrop, onAuth);
+      var err = new Error('该平台暂无沙箱协议源（' + __lgjPlatformName() + '）');
+      return { start: function () { return Promise.reject(err); }, stop: function () { /* 忽略 */ } };
+    }
+  
+    // ---------------- 斗鱼协议源（真机协议验证：docs/斗鱼协议采集-全量测试.md） ----------------
+    function DouyuSource(roomId, onDanmu, onDrop, onAuth) {
+      this.roomId = roomId;
+      this.onDanmu = onDanmu;
+      this.onDrop = onDrop;
+      this.onAuth = onAuth;
+      this.ws = null;
+      this.hb = null;
+      this.stopped = false;
+      this.alive = false;
+    }
+    DouyuSource.prototype.stop = function () {
+      this.stopped = true; this.alive = false;
+      if (this.hb) { clearInterval(this.hb); this.hb = null; }
+      if (this.ws) { try { this.ws.close(); } catch (_e) { /* 忽略 */ } this.ws = null; }
+    };
+    DouyuSource.prototype._frame = function (typeStr) {
+      var enc = new TextEncoder().encode(typeStr + '\x00');
+      var len = 8 + enc.length;          // len = 双 u32 + type + body（含 \0）
+      var buf = new Uint8Array(4 + len);
+      var v = new DataView(buf.buffer);
+      v.setUint32(0, len, true);
+      v.setUint32(4, len, true);
+      v.setUint32(8, 0x02b1, true);      // 客户端 → 服务器
+      buf.set(enc, 12);
+      return buf;
+    };
+    DouyuSource.prototype.start = function () {
+      var self = this;
+      var hosts = [8501, 8502, 8503, 8504, 8505, 8506];
+      var lastErr = null;
+      var attempt = function (i) {
+        if (self.stopped) return Promise.reject(new Error('stopped'));
+        return new Promise(function (resolve, reject) {
+          var ws;
+          try { ws = new WebSocket('wss://danmuproxy.douyu.com:' + hosts[i] + '/'); } catch (e) { reject(e); return; }
+          ws.binaryType = 'arraybuffer';
+          var opened = false;
+          var loginResolve = resolve;
+          var to = setTimeout(function () { if (!opened) { try { ws.close(); } catch (_e) { /* 忽略 */ } reject(new Error('open-timeout')); } }, 6000);
+          ws.onopen = function () {
+            opened = true;
+            self.ws = ws;
+            self.alive = true;
+            var rid = self.roomId;
+            var login = 'type@=loginreq/roomid@=' + rid
+              + '/dfl@=sn@AA=106@ASss@AA=1@Ssn@AA=107@ASss@AA=1@Ssn@AA=108@ASss@AA=1@Ssn@AA=105@ASss@AA=1'
+              + '/username@=visitor' + String(Math.floor(Math.random() * 900000000) + 100000000)
+              + '/uid@=' + String(Math.floor(Math.random() * 9000000000) + 1000000000)
+              + '/ver@=20220825/aver@=218101901/ct@=0/';
+            try { ws.send(self._frame(login)); } catch (_e) { /* 忽略 */ }
+            // 斗鱼对缺 loginreq/坏 room 不主动断开 → 客户端 5s 登录超时判定
+            setTimeout(function () {
+              if (!self.stopped && !self.alive) return;
+              if (!loginResolve) return;
+              loginResolve(false); // 超时仍 resolve(false)，由上层按失败处理
+            }, 5000);
+          };
+          ws.onmessage = function (ev) { self._handle(ev.data, loginResolve, ws); };
+          ws.onerror = function () { clearTimeout(to); if (!opened) reject(new Error('ws-error')); };
+          ws.onclose = function () {
+            var wasActive = self.alive;
+            self.alive = false;
+            if (self.hb) { clearInterval(self.hb); self.hb = null; }
+            if (self.stopped) return;
+            if (wasActive && self.onDrop) self.onDrop();
+          };
+        }).catch(function (e) {
+          lastErr = e;
+          if (i < hosts.length - 1) return attempt(i + 1);
+          return Promise.reject(lastErr);
+        });
+      };
+      return attempt(0).then(function (ok) {
+        if (!ok || self.stopped) { if (self.ws) { try { self.ws.close(); } catch (_e) { /* 忽略 */ } } throw new Error('douyu-login-timeout'); }
+        try { self.ws.send(self._frame('joingroup/rid@=' + self.roomId + '/gid@=1/')); } catch (_e) { /* 忽略 */ }
+        self.hb = setInterval(function () {
+          if (self.alive && self.ws && self.ws.readyState === 1) {
+            try { self.ws.send(self._frame('mrkl/')); } catch (_e) { /* 忽略 */ }
+          }
+        }, 40000);
+        if (self.onAuth) { try { self.onAuth(); } catch (_e) { /* 忽略 */ } }
+      });
+    };
+    DouyuSource.prototype._handle = function (data, loginResolve, wsRef) {
+      var self = this;
+      if (self.stopped) return;
+      var now = Date.now();
+      try {
+        var raw = new Uint8Array(data);
+        var dec = new TextDecoder();
+        var off = 0;
+        while (off + 12 <= raw.length) {
+          var dv = new DataView(raw.buffer, raw.byteOffset + off, raw.length - off);
+          var lenA = dv.getUint32(0, true);
+          var lenB = dv.getUint32(4, true);
+          var type = dv.getUint32(8, true);
+          if (lenA < 9 || lenA > 65536 || lenA !== lenB) break;
+          var msgEnd = off + 4 + lenA;
+          if (msgEnd > raw.length) break;
+          var bodyBytes = raw.slice(off + 12, msgEnd);
+          var end = bodyBytes.length;
+          for (var zi = 0; zi < bodyBytes.length; zi++) { if (bodyBytes[zi] === 0) { end = zi; break; } }
+          var text = dec.decode(bodyBytes.subarray(0, end));
+          if (type === 0x02b2 && text) self._consume(text, loginResolve, now);
+          off = msgEnd;
+        }
+      } catch (_e) { /* 单帧容错 */ }
+    };
+    DouyuSource.prototype._consume = function (text, loginResolve, now) {
+      var self = this;
+      var type = '';
+      var kv = {};
+      var parts = text.split('/');
+      for (var i = 0; i < parts.length; i++) {
+        var seg = parts[i];
+        if (!seg) continue;
+        var eq = seg.indexOf('@=');
+        if (eq < 0) continue;
+        var k = seg.slice(0, eq);
+        var val = seg.slice(eq + 2);
+        if (k === 'type') type = val;
+        else kv[k] = val;
+      }
+      if (type === 'loginres') {
+        if (loginResolve) { loginResolve(true); loginResolve = null; } // 匿名负 userid 也成功
+        return;
+      }
+      if (type === 'chatmsg' && kv.txt) {
+        var uid = kv.uid !== undefined ? kv.uid : null;
+        self.onDanmu(String(kv.txt), { id: String(uid) + ':' + String(kv.txt).length, uid: uid, nick: String(kv.nn || '?'), ts: now });
+      }
+    }
+  
   setTimeout(boot, 1500);
 })();
 
