@@ -1,18 +1,27 @@
 // ==UserScript==
 // @name         烂梗机
 // @namespace    http://tampermonkey.net/
-// @version      1.1.20
-// @description  多平台自动复读弹幕 | 智能去重 | 候选实时刷新(限50) | 模块化重构
+// @version      1.2.1
+// @description  多平台自动复读弹幕 | DOM+协议双引擎 | 智能去重 | L3 安全阀
 // @match        https://www.douyu.com/*
 // @match        https://www.huya.com/*
 // @match        https://live.bilibili.com/*
 // @match        https://live.douyin.com/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
+// @connect      api.bilibili.com
+// @connect      api.live.bilibili.com
+// @connect      live.bilibili.com
 // @grant        GM_setValue
 // @run-at       document-end
+// @author        LaGenJi contributors
+// @license       MIT
 // ==/UserScript==
 // 版本历史：
+// 1.2.0 hybrid（DOM+协议双引擎互斥切换）：修复双源叠加/房间号/安全阀持久化/断线重连/开关联动；详见 v2/SPEC.md
 // 1.1.8 新增候选强制刷新 / 智能去重 / 全链路日志
 // 1.1.9 修复：智能去重不再丢弃纯数字弹幕；单一调度链消除双定时器竞态；
 //            正则结果缓存；移除 console 劫持与死代码；模块化重构
@@ -156,7 +165,7 @@
     // 防重标记带版本号：检测到其他版本已运行（多版本共存）时醒目告警。
     // 注意：1.1.12 及更早版本不设置此标记，无法拦截，升级前务必删除旧版脚本，
     // 否则同页面多实例并发发送（README/发布说明中需强调）。
-    const INSTALLED_VERSION = '1.1.20';
+    const INSTALLED_VERSION = '1.2.1';
     if (document.documentElement) {
         const marker = document.documentElement.getAttribute('data-lgj-loaded');
         if (marker) {
@@ -340,12 +349,13 @@
      * 各平台系统消息文本特征不一，此处用启发式前缀/关键词匹配，命中即丢弃。
      */
     function isSystemDanmaku(text) {
+        // 1.2.0：优先用 hybrid-core 的增强启发式（系统/公告/礼物/进场/粉丝团/风控等）
+        if (typeof window.__lgjIsSystemDanmaku === 'function') {
+            try { return window.__lgjIsSystemDanmaku(text); } catch (_) { /* 忽略 */ }
+        }
         const t = String(text).trim();
         if (!t) return false;
-        // 前缀型：欢迎语 / 系统消息 / 温馨提示 开头的弹幕（各平台通用特征）
         if (/^(欢迎来到|系统消息|温馨提示|欢迎.{0,12}进入直播间)/.test(t)) return true;
-        // 修复（1.1.18）：第二条例加前缀锚定 + 短文本限定——旧实现 /(...|本直播间)/
-        //      全文匹配会把「本直播间怎么没声音」这类正常弹幕也过滤掉
         if (t.length <= 40 && /^(温馨提示|系统公告|直播间提示|本直播间)/.test(t)) return true;
         return false;
     }
@@ -1080,12 +1090,14 @@
             try { state.danmuObserver.disconnect(); } catch (_) { /* 忽略 */ }
         }
 
-        // 重置统计与缓存（新直播间重新统计）
-        state.timestamps = [];
-        state.lastTsCleanup = 0;
-        state.freqMap.clear();
-        state.weightedMap.clear();
-        state.danmuDirty = true;
+        // 重置统计与缓存（新直播间重新统计；协议掉线回落 DOM 时保留，避免候选池清零）
+        if (!window.__lgjKeepStats) {
+            state.timestamps = [];
+            state.lastTsCleanup = 0;
+            state.freqMap.clear();
+            state.weightedMap.clear();
+            state.danmuDirty = true;
+        }
 
         /**
          * 处理单个新增节点，返回是否捕获到弹幕。
@@ -1101,7 +1113,8 @@
             const captureOne = (el, tag) => {
                 const text = parser.extractText(el);
                 if (!text) return false;
-                if (isSystemDanmaku(text)) {
+                if (isSystemDanmaku(text) || (window.__lgjIsSystemNode && window.__lgjIsSystemNode(el))) {
+                    if (window.__lgjCountSystemFiltered) { try { window.__lgjCountSystemFiltered(text); } catch (_) { /* 忽略 */ } }
                     Logger.debug('过滤', `系统弹幕: "${text.slice(0, 40)}"`);
                     return false;
                 }
@@ -1289,9 +1302,12 @@
             if (top.count >= state.config.trendingThreshold) return top;
         }
 
-        // 按权重随机
+        // 按权重随机（1.2.0：叠加协议结构化数据 boost，DOM 模式为 1）
         let total = 0;
-        for (const c of candidates) total += c.weight;
+        for (const c of candidates) {
+            if (window.__lgjMetaBoost) { try { c.weight *= window.__lgjMetaBoost(c.text); } catch (__e) { /* 忽略 */ } }
+            total += c.weight;
+        }
         if (total <= 0) return candidates[0];
 
         let rand = Math.random() * total;
@@ -1309,16 +1325,25 @@
         if (!msg || state.isSending) return { success: false, errorCode: 'BUSY', message: '正在发送中' };
         if (!state.isRunning) return { success: false, errorCode: 'STOPPED', message: '机器人已停止' };
 
+        // 1.2.0 L3 安全阀（fail-closed）：仅在确实要发送时判定；
+        // 未就绪/未确认/被拦截一律拒发，且返回 SAFETY_* 错误码
+        if (!window.__lgjSafety || !window.__lgjSafety.allow(msg)) {
+            var __svReason = window.__lgjSafety ? window.__lgjSafety.reasonText() : '安全阀未就绪';
+            var __svCode = window.__lgjSafety ? window.__lgjSafety.reason() : 'NOT_READY';
+            try { console.warn('[烂梗机-安全阀] ', __svReason); if (window.__lgjLog) window.__lgjLog('安全阀', __svReason + ' | ' + __svCode); } catch (__w) { /* 忽略 */ }
+            return { success: false, errorCode: 'SAFETY_' + __svCode, message: '安全阀拦截: ' + __svReason };
+        }
         state.isSending = true;
         try {
-            const result = await sender.send(msg);
+            const result = await (window.__lgjSend ? window.__lgjSend(msg) : sender.send(msg));
+            if (result.success && window.__lgjSafety) { try { window.__lgjSafety.note(msg); } catch (__e) { /* 忽略 */ } }
             if (result.success) {
                 updateSentHistory(msg);
                 state.pendingMsg = null;
                 state.retryCount = 0;
                 state.lastRetryTime = 0;
                 state.lastErrorCode = null;
-                Logger.send(`发送成功: ${msg}`);
+                Logger.send(`发送成功: ${msg}${window.__lgjSendCtx ? ' | ' + window.__lgjSendCtx() : ''}`);
                 return { success: true };
             } else {
                 state.pendingMsg = msg;
@@ -1411,6 +1436,8 @@
      */
     async function runBot() {
         if (!state.isRunning || state.isSending) return;
+        // L4：非 leader 标签页不发送（多标签唯一发送者）
+        if (window.__lgjIsLeader && !window.__lgjIsLeader()) return;
 
         // 有待重试消息：检查是否到达重试时间
         if (state.pendingMsg) {
@@ -1418,7 +1445,8 @@
             const due = now - state.lastRetryTime >= TIMING.RETRY_DELAY_MS;
             // 修复：SEND_FAILED（输入框未清空）不重试——可能实际已发出，
             //      重发只会造成重复弹幕；仅"明确未发出"的错误才重试
-            const retryable = state.lastErrorCode && state.lastErrorCode !== 'SEND_FAILED';
+            const retryable = state.lastErrorCode && state.lastErrorCode !== 'SEND_FAILED'
+                && state.lastErrorCode !== 'SAFETY_RANDOM_SKIP';
 
             if (state.retryCount < TIMING.RETRY_MAX_ATTEMPTS && due && retryable) {
                 state.retryCount++;
@@ -1448,6 +1476,7 @@
         if (!candidates.length) return;
 
         const selected = weightedRandomSelect(candidates);
+        if (window.__lgjOnSelect) { try { window.__lgjOnSelect(selected, candidates); } catch (__e) { /* 忽略 */ } }
         if (!selected || !state.isRunning) return;
 
         state.nextPreviewMsg = selected.text;
@@ -1552,6 +1581,8 @@
      */
     function ensureObserverRunning() {
         if (state.standDown) return;      // 已让位：不再恢复监听
+        // 1.2.0：协议源接管时不得再启动 DOM observer（避免双源叠加）
+        if (window.__lgjSourceKind === 'protocol') return;
         if (state.danmuObserver) return; // 已在监听中
 
         // 1.1.20：优先重新探测真实容器；若此前已经降级到 body，则恢复 body 监听。
@@ -1702,8 +1733,9 @@
      *      改为正则切分：保留 /.../ 段为独立词条，其余按 / 或 , 分隔。
      */
     function parseDelimitedList(raw) {
-        const matches = String(raw).match(/\/[^/]+\/|[^/,]+/g) || [];
-        return matches.map(s => s.trim()).filter(Boolean);
+        // 1.2.0 修复：只按换行分隔——彻底消除 / 与 , 既是分隔符又是正则内容时的歧义。
+        // 每行一个词条；/xxx/（含逗号/斜杠）形式仍按正则整体处理。
+        return String(raw).split(/\n/).map(s => s.trim()).filter(Boolean);
     }
 
     // =========================================================================
@@ -1868,12 +1900,15 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
             toggle.addEventListener('change', e => {
                 state.isRunning = e.target.checked;
                 if (state.isRunning) {
+                    // 1.2.0：引擎先决定数据源（协议/探测会同步暂停 DOM，避免双源叠加）
+                    if (window.__lgjEngineOnStart) { try { window.__lgjEngineOnStart(); } catch (__e) { /* 忽略 */ } }
                     // 修复：打开开关时确保 observer 已启动
                     //（stopBot 断开后重启需重新监听弹幕）
                     ensureObserverRunning();
                     switchMode();
                 } else {
                     stopBot();
+                    if (window.__lgjEngineOnStop) { try { window.__lgjEngineOnStop(); } catch (__e2) { /* 忽略 */ } }
                 }
             });
         }
@@ -2125,6 +2160,7 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
         });
 
         panel.innerHTML = buildSettingsHTML();
+        if (window.__lgjEnhanceSettings) { try { window.__lgjEnhanceSettings(panel); } catch (_) { /* 忽略 */ } }
         overlay.appendChild(panel);
         document.body.appendChild(overlay);
 
@@ -2194,8 +2230,8 @@ input:checked + .bot-slider:before { transform: translateX(20px); background-col
     function buildSettingsHTML() {
         const cfg = state.config;
         const theme = cfg.theme || DEFAULT_THEME;
-        const blocklist = state.blocklist.join(' / ');
-        const priority = state.priorityWords.join(' / ');
+        const blocklist = state.blocklist.join('\n');
+        const priority = state.priorityWords.join('\n');
         const rules = formatFilterRulesForDisplay(cfg.filterRules || []);
 
         return `
@@ -2221,7 +2257,7 @@ ${buildSection('⚡ 模式设置', `
 
 ${buildSection('🚫 屏蔽词 & 高级筛选', `
   ${buildTextareaRow('s-blocklist', '屏蔽词', blocklist, 2)}
-  <div style="font-size:calc(var(--bot-font-size,12px) - 2px);color:#666;margin-top:2px;">用斜杠 / 分隔，支持正则 /广告/</div>
+  <div style="font-size:calc(var(--bot-font-size,12px) - 2px);color:#666;margin-top:2px;">每行一个；/xxx/ 为正则</div>
   ${buildTextareaRow('s-filterRules', '筛选规则', rules, 3)}
   <div style="font-size:calc(var(--bot-font-size,12px) - 2px);color:#666;margin-top:2px;">每行一条，如 length>10, contains:哈哈, regex:/^\\d+$/</div>
 `)}
@@ -2233,7 +2269,7 @@ ${buildSection('⭐ 优先词', `
   </div>
   ${buildTextareaRow('s-priorityWords', '优先词', priority, 2)}
   ${buildInputRow('s-priorityWeight', '权重加成', cfg.priorityWeight, 1, 20, '0.5')}
-  <div style="font-size:calc(var(--bot-font-size,12px) - 2px);color:#666;margin-top:2px;">用斜杠 / 分隔，支持正则</div>
+  <div style="font-size:calc(var(--bot-font-size,12px) - 2px);color:#666;margin-top:2px;">每行一个；/xxx/ 为正则</div>
 `)}
 
 ${buildThemeSection(theme)}
@@ -2522,6 +2558,8 @@ ${buildDebugSection()}
     function yieldToBlancFrame(reason) {
         if (state.standDown) return;
         state.standDown = true;
+        // 1.2.0：让位时停协议/选举并释放 leader 租约，避免主文档占着 leader 让 iframe 实例待机
+        if (window.__lgjEngineOnStandDown) { try { window.__lgjEngineOnStandDown(); } catch (__e) { /* 忽略 */ } }
         state.isRunning = false;
         if (state.danmuObserver) {
             try { state.danmuObserver.disconnect(); } catch (_) { /* 忽略 */ }
@@ -2577,7 +2615,9 @@ ${buildDebugSection()}
                     // 修复：若用户已提前打开开关（ensureObserverRunning 已启动监听），
                     // 不可重复 startDanmuObserver——它会 freqMap.clear() 清空已采集数据，
                     // 且产生双 observer 导致每条弹幕重复计数（count 翻倍、权重虚高）
-                    if (!state.danmuObserver) {
+                    if (window.__lgjSourceKind === 'protocol') {
+                        Logger.debug('烂梗机', '协议源接管，容器轮询不启动 DOM observer');
+                    } else if (!state.danmuObserver) {
                         startDanmuObserver(container);
                         scheduleWeightUpdate();
                     } else {
@@ -2600,7 +2640,9 @@ ${buildDebugSection()}
                     Logger.warn('烂梗机', '弹幕容器查找超时，监听整个文档（仅采集类弹幕节点）');
                     state.degradedToBody = true;   // 1.1.19：降级标志，供 handleNode 过滤
                     state.containerElement = document.body;
-                    if (!state.danmuObserver) {
+                    if (window.__lgjSourceKind === 'protocol') {
+                        Logger.debug('烂梗机', '协议源接管，body 降级不启动 DOM observer');
+                    } else if (!state.danmuObserver) {
                         startDanmuObserver(document.body);
                     }
                 }
@@ -2624,7 +2666,7 @@ ${buildDebugSection()}
         setInterval(() => {
             if (state.standDown) return; // 让位后空转：不刷新面板/不重启调度
             ensurePanelAlive();          // 1.1.19：面板被页面抹掉后重建
-            checkConfigUpdate();
+            // 1.2.0: checkConfigUpdate 由 GM_addValueChangeListener 事件驱动（见 hybrid 注入）
             if (state.isRunning) switchMode();
             const candidates = getWeightedCandidates();
             // 修复：预览只在空时填充——runBot 发送后已把 nextPreviewMsg 设为
@@ -2821,5 +2863,1868 @@ ${buildDebugSection()}
     // =========================================================================
     // 启动
     // =========================================================================
+
+// ===== 1.2.0 Hybrid 注入（自动生成，勿手改）=====
+(function () {
+  'use strict';
+  // ================= 1.2.0 Hybrid 引擎（构建时注入 legacy 尾部）=================
+  // 设计：不重构 legacy；本块在 legacy 同一作用域追加——
+  //  1) 协议源（B 站自连 wss）与 DOM 源互斥切换，绝不同时写 freqMap/timestamps（P0-1）
+  //  2) 房间号解析支持 /blanc//h5/ 与父文档兜底（P0-2）
+  //  3) L3 安全阀：配置合并 + 硬上限夹取 + 计数持久化 + 跨标签近似同步（P0-3/P0-4）
+  //  4) 协议断线指数退避重连，多次失败回落 DOM（P1-6）
+  //  5) 协议源随机器人开关启停；关闭时不连 wss（P1-5）
+  //  6) 面板被 SPA 重建后自动重挂引擎 UI（P1-8）
+  //  7) 持久化环形日志读回内存，导出/诊断可见（P1-9）
+  // 纯逻辑（安全阀/房间号/导出校验）在 scripts/hybrid/hybrid-core.mjs，构建时内联，
+  // 同一份代码由 Vitest 单测覆盖（不再出现「测 A 发 B」）。
+
+
+  // 运行时 MD5（RFC 1321 紧凑实现，无依赖）——供 wbi 签名在注入脚本内使用
+  // 正确性由 build 前向量校验（scripts/check-md5.mjs）保证。
+  
+  function md5(input) {
+    const utf8 = typeof TextEncoder !== 'undefined'
+      ? new TextEncoder().encode(String(input))
+      : (() => { const s = String(input); const b = []; for (let i = 0; i < s.length; i++) b.push(s.charCodeAt(i) & 0xff); return new Uint8Array(b); })();
+  
+    // 填充
+    const bitLen = utf8.length * 8;
+    const padded = new Uint8Array(((utf8.length + 8) >> 6 << 6) + 64);
+    padded.set(utf8);
+    padded[utf8.length] = 0x80;
+    const dv = new DataView(padded.buffer);
+    dv.setUint32(padded.length - 8, bitLen >>> 0, true);
+    dv.setUint32(padded.length - 4, Math.floor(bitLen / 0x100000000), true);
+  
+    let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  
+    const rotl = (x, c) => (x << c) | (x >>> (32 - c));
+    const add = (x, y) => (x + y) | 0;
+  
+    const K = new Int32Array([
+      0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+      0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+      0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+      0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+      0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+      0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+      0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+      0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    ]);
+    const S = new Uint8Array([
+      7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+      5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+      4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+      6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ]);
+  
+    const M = new Int32Array(16);
+    for (let off = 0; off < padded.length; off += 64) {
+      for (let i = 0; i < 16; i++) M[i] = dv.getInt32(off + i * 4, true);
+      let A = a0, B = b0, C = c0, D = d0;
+      for (let i = 0; i < 64; i++) {
+        let F, g;
+        if (i < 16) { F = (B & C) | (~B & D); g = i; }
+        else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+        else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+        else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+        F = add(add(add(F, A), K[i]), M[g]);
+        A = D; D = C; C = B;
+        B = add(B, rotl(F, S[i]));
+      }
+      a0 = add(a0, A); b0 = add(b0, B); c0 = add(c0, C); d0 = add(d0, D);
+    }
+  
+    const out = new Uint8Array(16);
+    const odv = new DataView(out.buffer);
+    odv.setInt32(0, a0, true); odv.setInt32(4, b0, true); odv.setInt32(8, c0, true); odv.setInt32(12, d0, true);
+    let hex = '';
+    for (let i = 0; i < 16; i++) hex += out[i].toString(16).padStart(2, '0');
+    return hex;
+  }
+
+
+  // ============================================================================
+  // 1.2.0 Hybrid 纯逻辑核心（可单测）
+  // ----------------------------------------------------------------------------
+  // 本文件同时被两处使用：
+  //   1) Vitest 直接 import（packages/core/test/hybrid-core.test.ts）
+  //   2) scripts/build-hybrid.mjs 在构建时剥掉 `export ` 后内联进用户脚本
+  // 因此这里只放「平台无关、无 GM_/DOM 副作用」的纯函数与可注入依赖的类。
+  // ============================================================================
+  
+  /** L3 安全阀默认硬顶（与 SPEC L3 对齐；这些值是「可调上限」的基准，不是建议值） */
+  const SAFETY_DEFAULTS = Object.freeze({
+    enabled: true,
+    minGapMs: 2000,
+    perMin: 30,
+    perHour: 200,
+    perDay: 1000,
+    cooldownAfter: 20,
+    cooldownMs: 600000,
+    pauseWhenHidden: true,
+    skipChance: 0.05,
+  });
+  
+  /**
+   * 硬边界：频次上限只可「更严」（≤默认），间隔/冷却只可「更严」（≥默认）。
+   * enabled 不在此列——它恒为 true，用户/导入都无法关闭安全阀（L3 不可绕过）。
+   */
+  const SAFETY_CAPS = Object.freeze({
+    perMin: SAFETY_DEFAULTS.perMin,
+    perHour: SAFETY_DEFAULTS.perHour,
+    perDay: SAFETY_DEFAULTS.perDay,
+    minGapMsFloor: SAFETY_DEFAULTS.minGapMs,
+    cooldownAfter: SAFETY_DEFAULTS.cooldownAfter,
+    cooldownMsFloor: SAFETY_DEFAULTS.cooldownMs,
+    skipChance: 0.5,
+  });
+  
+  /**
+   * 把任意（可能残缺/被篡改的）配置合并成完整、合法、带上限的配置。
+   * 这是 P0-3 的根治点：部分配置不得让任何硬约束变成 undefined 而被跳过。
+   */
+  function mergeSafetyConfig(raw, defaults = SAFETY_DEFAULTS) {
+    const base = { ...defaults };
+    const out = { ...base };
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      for (const key of Object.keys(base)) {
+        const def = base[key];
+        const val = raw[key];
+        if (typeof def === 'boolean') {
+          if (typeof val === 'boolean') out[key] = val;
+        } else if (typeof def === 'number') {
+          if (typeof val === 'number' && Number.isFinite(val)) out[key] = val;
+        }
+      }
+    }
+    // 类型安全后再夹到硬边界内
+    out.perMin = clampInt(out.perMin, 1, SAFETY_CAPS.perMin);
+    out.perHour = clampInt(out.perHour, 1, SAFETY_CAPS.perHour);
+    out.perDay = clampInt(out.perDay, 1, SAFETY_CAPS.perDay);
+    out.cooldownAfter = clampInt(out.cooldownAfter, 1, SAFETY_CAPS.cooldownAfter);
+    out.minGapMs = clampInt(out.minGapMs, SAFETY_CAPS.minGapMsFloor, 3600000);
+    out.cooldownMs = clampInt(out.cooldownMs, SAFETY_CAPS.cooldownMsFloor, 86400000);
+    out.skipChance = Math.min(SAFETY_CAPS.skipChance, Math.max(0, Number(out.skipChance) || 0));
+    // L3 不可绕过：安全阀恒启用，配置/导入都无法关闭
+    out.enabled = true;
+    out.pauseWhenHidden = out.pauseWhenHidden !== false;
+    return out;
+  }
+  
+  function clampInt(v, min, max) {
+    const n = Math.floor(Number(v));
+    if (!Number.isFinite(n)) return min;
+    return Math.min(max, Math.max(min, n));
+  }
+  
+  /**
+   * B 站房间号解析（P0-2）。
+   * 支持：/12345、/blanc/12345、/h5/12345、?room_id=12345，以及 blanc iframe 用父文档 URL 兜底。
+   * @param {string} href 当前文档 URL
+   * @param {string} [topHref] 同源父文档 URL（跨域时调用方传空）
+   * @returns {number} 房间号；解析失败返回 0
+   */
+  function parseBiliRoomId(href, topHref) {
+    return pickRoomId(href) || pickRoomId(topHref) || 0;
+  }
+  
+  function pickRoomId(href) {
+    if (!href || typeof href !== 'string') return 0;
+    const pathMatch = /live\.bilibili\.com\/(?:blanc\/|h5\/)?(\d+)/.exec(href);
+    if (pathMatch) return parseInt(pathMatch[1], 10) || 0;
+    const queryMatch = /[?&]room_?id=(\d+)/i.exec(href);
+    if (queryMatch) return parseInt(queryMatch[1], 10) || 0;
+    return 0;
+  }
+  
+  /** 导出包结构校验（P0-3 的第二半：旧实现校验错了对象层级，等于没校验） */
+  function validateConfigBundle(bundle) {
+    if (!bundle || typeof bundle !== 'object' || Array.isArray(bundle)) return '不是有效 JSON 对象';
+    if (bundle.__lgjExport !== 1) return '缺少 __lgjExport=1 标记（非烂梗机导出文件）';
+  
+    const cfg = bundle.config;
+    if (cfg !== undefined) {
+      if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return 'config 应为对象';
+      const numKeys = ['minMsgLength', 'lengthThreshold', 'lengthBonus', 'trendingThreshold',
+        'dedupWindowSec', 'dedupHistorySize', 'crazyModeDPM', 'crazyInterval',
+        'normalModeDPM', 'normalIntervalMin', 'normalIntervalMax', 'zenInterval', 'priorityWeight'];
+      for (const key of numKeys) {
+        if (key in cfg && (typeof cfg[key] !== 'number' || !Number.isFinite(cfg[key]))) {
+          return `config.${key} 应为有限数字`;
+        }
+      }
+    }
+    if (bundle.theme !== undefined && (!bundle.theme || typeof bundle.theme !== 'object' || Array.isArray(bundle.theme))) {
+      return 'theme 应为对象';
+    }
+    for (const key of ['blocklist', 'priority', 'filterRules']) {
+      if (bundle[key] !== undefined && !Array.isArray(bundle[key])) return `${key} 应为数组`;
+    }
+    if (bundle.engine !== undefined && (!bundle.engine || typeof bundle.engine !== 'object' || Array.isArray(bundle.engine))) {
+      return 'engine 应为对象';
+    }
+    if (bundle.safety !== undefined && (!bundle.safety || typeof bundle.safety !== 'object' || Array.isArray(bundle.safety))) {
+      return 'safety 应为对象';
+    }
+    return null;
+  }
+  
+  /**
+   * 系统弹幕/公告/礼物/进场/粉丝团等「非正常弹幕」启发式识别。
+   * 目标：把平台自己发的欢迎语、公告、礼物、进场、关注、粉丝团、风控提示等排除出候选池，
+   * 同时尽量不误杀正常玩家弹幕。长文本（>80）交给屏蔽词规则，不在此误杀。
+   */
+  const SYSTEM_DANMAKU_PATTERNS = [
+    /^(欢迎来到|欢迎.{0,12}(进入|来到)直播间)/,
+    /^(系统消息|系统公告|温馨提示|直播间提示|本直播间|公告|通知|提醒)/,
+    /(关注了主播|关注了直播间|点关注|关注主播|点击关注|求关注|没点关注的)/,
+    /^(感谢|谢谢).{0,8}(关注|礼物|打赏|投喂|支持)/,
+    /(送出了|赠送了|投喂了|打赏了|送出了礼物|开通了|续费了|送出了.{0,6}(火箭|飞机|礼物))/,
+    /(加入了粉丝团|加入粉丝团|粉丝团|粉丝牌|点亮了|勋章|大航海|舰长|提督|总督|守护)/,
+    /^.{1,16}(进入了直播间|来到了直播间|进入直播间|离开了直播间)$/,
+    /^(恭喜.{0,8}(中奖|获奖|获得|抽中)|中奖|获奖|抽奖|打卡|签到|领取)/,
+    /(禁言|封禁|违规|警告|举报|管理员|房管|超管)/,
+    /^(主播|直播|房间)(已|即将|正在)?(开播|下播|上播|关闭)/,
+    /^(当前|本场|今日|今晚).{0,10}(人气|热度|排名|榜单)/,
+  ];
+  
+  function isSystemDanmaku(text) {
+    const t = String(text).trim();
+    if (!t) return false;
+    if (t.length > 80) return false; // 长文本更可能是正常弹幕/广告，交给屏蔽词
+    for (const re of SYSTEM_DANMAKU_PATTERNS) if (re.test(t)) return true;
+    return false;
+  }
+  
+  
+  /**
+   * 可持久化、跨标签近似同步的 L3 安全阀。
+   * 依赖注入（storage / now / isHidden / rand），因此可在 Node 中完整单测。
+   *
+   * 设计要点：
+   * - 配置与计数分离存储：配置 LGJ_SAFETY_v1，计数 LGJ_SAFETY_STATE_v1；
+   * - 计数落盘（节流）+ 跨标签按槽取 max 合并 → 刷新页面不再清零（P0-4）；
+   * - allow() 只做判定，note() 才计数；RANDOM_SKIP 由调用方按「不可重试」处理（P1-7）；
+   * - 任何配置残缺都先 mergeSafetyConfig，硬上限不可被 undefined 绕过（P0-3）。
+   */
+  class HybridSafety {
+    constructor(opts = {}) {
+      this.now = opts.now || (() => Date.now());
+      this.isHidden = opts.isHidden || (() => false);
+      this.rand = opts.rand || Math.random;
+      this.storage = opts.storage || null;
+      this.limitsKey = opts.limitsKey || 'LGJ_SAFETY_v1';
+      this.stateKey = opts.stateKey || 'LGJ_SAFETY_STATE_v1';
+      this.ackKey = opts.ackKey || 'LGJ_ACK_v1';
+  
+      this.limits = mergeSafetyConfig(opts.limits);
+      this.ring = Object.create(null);
+      this.textCnt = Object.create(null);
+      this.lastSentAt = 0;
+      this.circuitUntil = 0;
+      this.lastReason = '';
+      this.lastReasonText = '';
+      this._lastPersist = 0;
+      this._lastLoad = 0;
+      this._dirty = false;
+      this._load();
+    }
+  
+    // ---- 风险确认（fail-closed：未确认一律拒发） ----
+    ackConfirmed() {
+      if (!this.storage) return false;
+      try {
+        const v = this.storage.get(this.ackKey, null);
+        return v === 1 || v === true || v === '1' || !!(v && v.ok === 1);
+      } catch (_) {
+        return false;
+      }
+    }
+  
+    confirmAck() {
+      if (!this.storage) return;
+      try { this.storage.set(this.ackKey, { ok: 1 }); } catch (_) { /* 忽略 */ }
+    }
+  
+    // ---- 配置 ----
+    getConfig() {
+      return { ...this.limits };
+    }
+  
+    setConfig(patch) {
+      this.limits = mergeSafetyConfig({ ...this.limits, ...(patch || {}) }, this.limits);
+      if (this.storage) {
+        try { this.storage.set(this.limitsKey, this.limits); } catch (_) { /* 忽略 */ }
+      }
+    }
+  
+    // ---- 判定 ----
+    allow(text, at) {
+      const now = at ?? this.now();
+      this.lastReason = '';
+      this.lastReasonText = '';
+  
+      // 每 3s 与其它标签页/上次会话合并一次计数（避免频繁读存储）
+      if (this.storage && now - this._lastLoad > 3000) this._load();
+  
+      if (!this.ackConfirmed()) return this._deny('ACK_REQUIRED', '请先阅读并在面板确认风险声明');
+      // 注意：没有 enabled 开关——安全阀恒启用，任何配置都无法绕过
+      if (this.limits.pauseWhenHidden && this.isHidden()) return this._deny('HIDDEN', '页面不可见（切后台）不发');
+      if (this.circuitUntil > now) return this._deny('CIRCUIT', '平台风控熔断中');
+  
+      if (this.limits.minGapMs > 0 && this.lastSentAt > 0
+        && now - this.lastSentAt < this.limits.minGapMs) {
+        return this._deny('MIN_GAP', '发送过密（最小间隔）');
+      }
+  
+      const rec = this.textCnt[text];
+      if (rec && rec.until > now) return this._deny('TEXT_COOLDOWN', '同一句冷却中');
+  
+      const minute = Math.floor(now / 60000);
+      if (this._windowSum(minute, 0) >= this.limits.perMin) return this._deny('PER_MIN', '每分钟上限');
+      if (this._windowSum(minute, 60) >= this.limits.perHour) return this._deny('PER_HOUR', '每小时上限');
+      if (this._windowSum(minute, 1440) >= this.limits.perDay) return this._deny('PER_DAY', '每日上限');
+  
+      if (this.limits.skipChance > 0 && this.rand() < this.limits.skipChance) {
+        return this._deny('RANDOM_SKIP', '人类化随机跳过');
+      }
+      return true;
+    }
+  
+    _deny(reason, text) {
+      this.lastReason = reason;
+      this.lastReasonText = text;
+      return false;
+    }
+  
+    /** 发送成功后登记（必须在 allow() 通过后调用） */
+    note(text, at) {
+      const now = at ?? this.now();
+      this.lastSentAt = now;
+      const minute = Math.floor(now / 60000);
+      this.ring[minute] = (this.ring[minute] || 0) + 1;
+  
+      const rec = this.textCnt[text] || { n: 0, until: 0 };
+      rec.n += 1;
+      if (rec.n >= this.limits.cooldownAfter) {
+        rec.n = 0;
+        rec.until = now + this.limits.cooldownMs;
+      }
+      this.textCnt[text] = rec;
+  
+      this._prune(now);
+      this._persist(false);
+    }
+  
+    /** 平台风控信号 → 熔断 */
+    trip(at, openMs = 600000) {
+      const now = at ?? this.now();
+      this.circuitUntil = Math.max(this.circuitUntil, now + Math.max(1000, Number(openMs) || 600000));
+      this._persist(true);
+    }
+  
+    refresh() {
+      this._load();
+    }
+  
+    flush() {
+      if (this._dirty) this._persist(true);
+    }
+  
+    reason() { return this.lastReason; }
+    reasonText() { return this.lastReasonText; }
+  
+    // ---- 内部 ----
+    _windowSum(nowMinute, winMin) {
+      let sum = 0;
+      for (let m = nowMinute - winMin; m <= nowMinute; m++) {
+        sum += this.ring[m] || 0;
+      }
+      return sum;
+    }
+  
+    _load() {
+      this._lastLoad = this.now();
+      if (!this.storage) return;
+      let s = null;
+      try { s = this.storage.get(this.stateKey, null); } catch (_) { s = null; }
+      if (!s || typeof s !== 'object') return;
+  
+      if (s.ring && typeof s.ring === 'object') {
+        for (const key of Object.keys(s.ring)) {
+          const v = Number(s.ring[key]) || 0;
+          this.ring[key] = Math.max(this.ring[key] || 0, v);
+        }
+      }
+      if (s.textCnt && typeof s.textCnt === 'object') {
+        for (const key of Object.keys(s.textCnt)) {
+          const r = s.textCnt[key];
+          if (!r || typeof r !== 'object') continue;
+          const cur = this.textCnt[key] || { n: 0, until: 0 };
+          this.textCnt[key] = {
+            n: Math.max(cur.n, Number(r.n) || 0),
+            until: Math.max(cur.until, Number(r.until) || 0),
+          };
+        }
+      }
+      if (typeof s.lastSentAt === 'number') this.lastSentAt = Math.max(this.lastSentAt, s.lastSentAt);
+      if (typeof s.circuitUntil === 'number') this.circuitUntil = Math.max(this.circuitUntil, s.circuitUntil);
+    }
+  
+    _persist(force) {
+      if (!this.storage) return;
+      const now = this.now();
+      if (!force && now - this._lastPersist < 1000) { this._dirty = true; return; }
+      this._lastPersist = now;
+      this._dirty = false;
+      try {
+        this.storage.set(this.stateKey, {
+          ring: this.ring,
+          textCnt: this.textCnt,
+          lastSentAt: this.lastSentAt,
+          circuitUntil: this.circuitUntil,
+          ts: now,
+        });
+      } catch (_) { /* 忽略 */ }
+    }
+  
+    _prune(now) {
+      const keys = Object.keys(this.ring);
+      if (keys.length > 2000) {
+        const cutoff = Math.floor(now / 60000) - 1500;
+        const next = Object.create(null);
+        for (const key of keys) {
+          if (parseInt(key, 10) > cutoff) next[key] = this.ring[key];
+        }
+        this.ring = next;
+      }
+      const stale = now - 86400000;
+      for (const key of Object.keys(this.textCnt)) {
+        const rec = this.textCnt[key];
+        if (rec && rec.n === 0 && rec.until < stale) delete this.textCnt[key];
+      }
+    }
+  }
+  
+  /**
+   * B 站弹幕发送接口返回码 → 归一化结果。
+   * fallback=true 表示「本次协议发送不可用，可安全回落 DOM」（请求未被平台受理）；
+   * 其余失败一律不回落，避免「请求已到达但响应异常」时双发。
+   */
+  function mapBiliSendCode(code) {
+    switch (Number(code)) {
+      case 0: return { ok: true, code: 'OK', fallback: false };
+      case -101: return { ok: false, code: 'NOT_LOGGED_IN', fallback: true };
+      case -111: return { ok: false, code: 'CSRF_MISSING', fallback: true };
+      case -400: return { ok: false, code: 'BAD_REQUEST', fallback: false };
+      case -403: return { ok: false, code: 'FORBIDDEN', fallback: false };
+      case -412: return { ok: false, code: 'RATE_LIMITED', fallback: false };
+      case 10030: return { ok: false, code: 'RATE_LIMITED', fallback: false };
+      case 1003212: return { ok: false, code: 'REJECTED', fallback: false };
+      default: return { ok: false, code: 'UNKNOWN', fallback: false };
+    }
+  }
+  
+  /**
+   * 多标签 leader 选举（L4）。
+   * - 共享 KV 的带过期租约保证「同一时刻只有一个标签页发送」；
+   * - 写后回读：并发写时只有最后写入者认为自己是 leader，其余立即转 follower；
+   * - storage 不可用时退化为「总是 leader」（单标签场景）。
+   */
+  class LeaderElection {
+    constructor(opts = {}) {
+      this.tabId = opts.tabId || ('t' + Math.random().toString(36).slice(2, 10));
+      this.key = opts.key || 'LGJ_LEADER_v1';
+      this.leaseMs = Math.max(3000, Number(opts.leaseMs) || 15000);
+      this.storage = opts.storage || null;
+      this.now = opts.now || (() => Date.now());
+      this.post = typeof opts.post === 'function' ? opts.post : null;
+      this.onChange = typeof opts.onChange === 'function' ? opts.onChange : (() => {});
+      this.leaderId = '';
+      this._timer = null;
+    }
+    isLeader() {
+      if (!this.storage) return true;
+      if (this.leaderId !== this.tabId) return false;
+      // 发送前校验租约：缩小「旧 leader 租约已过期、但还没到下个 tick」的双发窗口
+      try {
+        const lease = this.storage.get(this.key, null);
+        const now = this.now();
+        if (lease && lease.tabId && lease.tabId !== this.tabId && (Number(lease.expiresAt) || 0) > now) {
+          this._setLeader(lease.tabId);
+          return false;
+        }
+      } catch (_) { /* 忽略 */ }
+      return true;
+    }
+    start() {
+      this.tick();
+      if (!this._timer) this._timer = setInterval(() => this.tick(), 5000);
+    }
+    stop() { if (this._timer) { clearInterval(this._timer); this._timer = null; } }
+    tick() {
+      const now = this.now();
+      let lease = null;
+      try { lease = this.storage ? this.storage.get(this.key, null) : null; } catch (_) { lease = null; }
+      const active = lease && typeof lease === 'object' && lease.tabId && (Number(lease.expiresAt) || 0) > now;
+      if (active && lease.tabId !== this.tabId) {
+        this._setLeader(lease.tabId);
+        return;
+      }
+      try {
+        if (this.storage) this.storage.set(this.key, { tabId: this.tabId, expiresAt: now + this.leaseMs });
+      } catch (_) { /* 忽略 */ }
+      let after = null;
+      try { after = this.storage ? this.storage.get(this.key, null) : null; } catch (_) { after = null; }
+      if (!after || after.tabId === this.tabId) {
+        this._setLeader(this.tabId);
+        if (this.post) { try { this.post({ t: 'hb', tabId: this.tabId, ts: now }); } catch (_) { /* 忽略 */ } }
+      } else {
+        this._setLeader(after.tabId);
+      }
+    }
+    onMessage(msg) {
+      if (!msg || msg.tabId === this.tabId) return;
+      if (msg.t === 'hb' || msg.t === 'leader') {
+        const now = this.now();
+        let lease = null;
+        try { lease = this.storage ? this.storage.get(this.key, null) : null; } catch (_) { lease = null; }
+        // 只在对方租约确实有效时才让位，避免伪造 hb 抢主
+        if (lease && lease.tabId === msg.tabId && (Number(lease.expiresAt) || 0) > now) {
+          this._setLeader(msg.tabId);
+        } else if (!lease && String(msg.tabId) < String(this.tabId)) {
+          // 兜底：某些管理器 GM 存储按标签页隔离（租约不可见）→ 用 tabId 字典序收敛
+          this._setLeader(msg.tabId);
+        }
+      }
+    }
+    _setLeader(id) {
+      if (this.leaderId === id) return;
+      this.leaderId = id;
+      this.onChange(id === this.tabId);
+    }
+  }
+
+  var CFG_KEY = 'LGJ_ENGINE_v1';
+  var SAFETY_KEY = 'LGJ_SAFETY_v1';
+  var SAFETY_STATE_KEY = 'LGJ_SAFETY_STATE_v1';
+  var ACK_KEY = 'LGJ_ACK_v1';
+  var MIXIN = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52];
+
+  // ---------------- 存储 / 日志 ----------------
+  function gmGet(key, fallback) {
+    try {
+      var raw = GM_getValue(key, null);
+      if (raw === null || raw === undefined) return fallback;
+      if (typeof raw === 'string') { try { return JSON.parse(raw); } catch (_e) { return raw; } }
+      return raw;
+    } catch (_e) { return fallback; }
+  }
+  function gmSet(key, value) {
+    try { GM_setValue(key, JSON.stringify(value)); } catch (_e) { /* 忽略 */ }
+  }
+  function loadCfg() {
+    var c = gmGet(CFG_KEY, {});
+    return (c && typeof c === 'object' && !Array.isArray(c)) ? c : {};
+  }
+  function saveCfg(patch) {
+    var c = loadCfg();
+    for (var k in patch) if (Object.prototype.hasOwnProperty.call(patch, k)) c[k] = patch[k];
+    gmSet(CFG_KEY, c);
+  }
+  function loadJson(key, def) {
+    var v = gmGet(key, def);
+    return (v && typeof v === 'object' && !Array.isArray(v)) ? v : def;
+  }
+  function loadJsonArr(key) {
+    var v = gmGet(key, []);
+    return Array.isArray(v) ? v : [];
+  }
+  function _plat() {
+    var h = location.hostname;
+    if (h.indexOf('douyu.com') >= 0) return 'douyu';
+    if (h.indexOf('huya.com') >= 0) return 'huya';
+    if (h.indexOf('bilibili.com') >= 0) return 'bilibili';
+    if (h.indexOf('douyin.com') >= 0) return 'douyin';
+    return 'unknown';
+  }
+  function _ringKey() { return _plat() + '_lgj_ringlog'; }
+
+  var _ringBuffer = null;
+  var _ringFlushTimer = null;
+  function ringLog(level, content) {
+    try {
+      if (!_ringBuffer) _ringBuffer = loadJsonArr(_ringKey());
+      _ringBuffer.push({ level: level, content: content, ts: Date.now() });
+      if (_ringBuffer.length > 200) _ringBuffer = _ringBuffer.slice(-200);
+      if (!_ringFlushTimer) {
+        _ringFlushTimer = setTimeout(function () { _ringFlushTimer = null; flushRingLog(); }, 2000);
+      }
+    } catch (_e) { /* 忽略 */ }
+  }
+  function flushRingLog() {
+    if (!_ringBuffer) return;
+    try { GM_setValue(_ringKey(), JSON.stringify(_ringBuffer)); } catch (_e) { /* 忽略 */ }
+  }
+  /** P1-9：把上次会话的持久化日志读回内存 Logger，使设置页导出/诊断可见 */
+  function restoreRingLog() {
+    try {
+      var persisted = loadJsonArr(_ringKey());
+      if (!persisted.length) return;
+      var merged = persisted.concat(Logger.getAll());
+      var seen = Object.create(null);
+      var out = [];
+      for (var i = merged.length - 1; i >= 0; i--) {
+        var l = merged[i];
+        if (!l || typeof l !== 'object') continue;
+        var k = (l.ts || 0) + '|' + (l.level || '') + '|' + (l.content || '');
+        if (seen[k]) continue;
+        seen[k] = 1;
+        out.unshift(l);
+      }
+      Logger._logs = out.slice(-Logger._maxLogs || -500);
+    } catch (_e) { /* 忽略 */ }
+  }
+  function hookRingLog() {
+    try {
+      var orig = Logger._push;
+      Logger._push = function (level, content) {
+        orig.call(Logger, level, content);
+        ringLog(level, content);
+      };
+    } catch (_e) { /* 忽略 */ }
+  }
+
+  // ---------------- 事件日志（升级版日志：引擎/协议/安全阀/选择等，不只发送内容） ----------------
+  var _autoWarned = false;
+  function logEvent(tag, content) {
+    try { console.log('[' + tag + '] ' + content); } catch (_e) { /* 忽略 */ }
+    try { Logger._push('event', (tag ? tag + ' | ' : '') + content); } catch (_e2) { /* 忽略 */ }
+  }
+  window.__lgjLog = logEvent;
+  window.__lgjSendCtx = function () {
+    try {
+      var d = window.__lgjLastDecision;
+      if (!d) return '';
+      return '模式=' + (state.currentMode || '-')
+        + ' DPM=' + getMessagesPerMinute()
+        + ' 来源=' + (window.__lgjSourceKind === 'protocol' ? '协议' : 'DOM')
+        + ' 权重=' + (d.weight ? Number(d.weight).toFixed(1) : '-')
+        + ' boost=' + (d.boost ? Number(d.boost).toFixed(2) : '1.00')
+        + ' 候选=' + (state.candidateCount || 0);
+    } catch (_e) { return ''; }
+  };
+  window.__lgjOnSelect = function (selected, candidates) {
+    try {
+      if (!selected) return;
+      var boost = window.__lgjMetaBoost ? window.__lgjMetaBoost(selected.text) : 1;
+      window.__lgjLastDecision = {
+        text: selected.text, count: selected.count, weight: selected.weight,
+        boost: boost, total: candidates ? candidates.length : 0,
+      };
+      logEvent('选择', '"' + String(selected.text).slice(0, 30) + '" 权重=' + Number(selected.weight || 0).toFixed(1)
+        + ' boost=' + Number(boost || 1).toFixed(2)
+        + ' 频次=' + (selected.count || 0)
+        + ' 候选=' + (candidates ? candidates.length : 0)
+        + ' DPM=' + getMessagesPerMinute()
+        + ' 来源=' + (window.__lgjSourceKind === 'protocol' ? '协议' : 'DOM'));
+    } catch (_e) { /* 忽略 */ }
+  };
+  // 系统弹幕过滤计数 + 60s 采集摘要（让日志有内容，不再只有“发送成功”）
+  var _sysFiltered = 0;
+  window.__lgjCountSystemFiltered = function (text) {
+    try {
+      _sysFiltered++;
+      if (_sysFiltered % 20 === 0) {
+        logEvent('过滤', '已排除 ' + _sysFiltered + ' 条系统弹幕（最近：' + String(text || '').slice(0, 30) + '）');
+      }
+    } catch (_e) { /* 忽略 */ }
+  };
+  function logPeriodicSummary() {
+    try {
+      if (!state.isRunning) return;
+      logEvent('采集', '近60s DPM=' + getMessagesPerMinute()
+        + ' 候选=' + (state.candidateCount || 0)
+        + ' freq=' + (state.freqMap ? state.freqMap.size : 0)
+        + ' 系统过滤=' + _sysFiltered
+        + ' 来源=' + (window.__lgjSourceKind === 'protocol' ? '协议' : 'DOM')
+        + ' 模式=' + (state.currentMode || '-')
+        + ' 引擎=' + mode);
+      _sysFiltered = 0;
+    } catch (_e) { /* 忽略 */ }
+  }
+
+
+  // ---------------- 跨域 HTTP（GM_xmlhttpRequest 优先，绕过 CORS；否则 fetch） ----------------
+  function readCookie(name) {
+    try {
+      var safe = name.replace(/[.*+?^${}()|[\]\\]/g, '\\    setTimeout(init, 3000);');
+      var m = document.cookie.match(new RegExp('(?:^|;\\s*)' + safe + '=([^;]*)'));
+      return m && m[1] ? decodeURIComponent(m[1]) : '';
+    } catch (_e) { return ''; }
+  }
+  function httpJson(url, opts) {
+    opts = opts || {};
+    var method = opts.method || 'GET';
+    var headers = opts.headers || {};
+    if (typeof GM_xmlhttpRequest === 'function') {
+      return new Promise(function (resolve, reject) {
+        try {
+          GM_xmlhttpRequest({
+            method: method, url: url, headers: headers, data: opts.data,
+            timeout: opts.timeout || 15000,
+            onload: function (res) {
+              try { resolve(JSON.parse(res.responseText)); } catch (_e2) { reject(new Error('bad-json')); }
+            },
+            onerror: function () { reject(new Error('xhr-error')); },
+            ontimeout: function () { reject(new Error('xhr-timeout')); },
+          });
+        } catch (e) { reject(e); }
+      });
+    }
+    return fetch(url, {
+      method: method, headers: headers, body: opts.data, credentials: 'include',
+    }).then(function (r) { return r.json(); });
+  }
+  var _realRoomCache = Object.create(null);
+  function resolveRealRoomId(room) {
+    if (_realRoomCache[room]) return Promise.resolve(_realRoomCache[room]);
+    return httpJson('https://api.live.bilibili.com/room/v1/Room/room_init?id=' + encodeURIComponent(room))
+      .then(function (j) {
+        var real = j && j.data && (j.data.room_id || j.data.roomid);
+        if (real) _realRoomCache[room] = real;
+        return real || 0;
+      })
+      .catch(function () { return 0; });
+  }
+
+
+
+  // ---------------- L3 安全阀 ----------------
+  var safetyStore = { get: gmGet, set: gmSet };
+  var safety = new HybridSafety({
+    limits: loadJson(SAFETY_KEY, {}),
+    storage: safetyStore,
+    limitsKey: SAFETY_KEY,
+    stateKey: SAFETY_STATE_KEY,
+    ackKey: ACK_KEY,
+    isHidden: function () { return typeof document !== 'undefined' && !!document.hidden; },
+  });
+
+  window.__lgjSafety = {
+    allow: function (text) { return safety.allow(text); },
+    note: function (text) { safety.note(text); },
+    reason: function () { return safety.reason(); },
+    reasonText: function () { return safety.reasonText(); },
+    trip: function (openMs) { safety.trip(undefined, openMs); ringLog('warn', '安全阀：收到平台风控信号，熔断 ' + Math.round((openMs || 600000) / 60000) + ' 分钟'); },
+    cfg: function () { return safety.getConfig(); },
+    setCfg: function (patch) { safety.setConfig(patch); },
+    confirmAck: function () { safety.confirmAck(); },
+    ackConfirmed: function () { return safety.ackConfirmed(); },
+    refresh: function () { safety.refresh(); },
+    flush: function () { safety.flush(); },
+  };
+
+  // 跨标签/跨页面：另一实例改计数或配置时刷新（P0-4）
+  try {
+    if (typeof GM_addValueChangeListener === 'function') {
+      GM_addValueChangeListener(SAFETY_STATE_KEY, function () { safety.refresh(); });
+      GM_addValueChangeListener(SAFETY_KEY, function () {
+        try { safety.limits = mergeSafetyConfig(loadJson(SAFETY_KEY, {}), safety.limits); } catch (_e2) { /* 忽略 */ }
+      });
+    }
+  } catch (_e) { /* 忽略 */ }
+  try { window.addEventListener('pagehide', function () { safety.flush(); flushRingLog(); }); } catch (_e) { /* 忽略 */ }
+
+  // 系统弹幕过滤（委托 hybrid-core 的增强启发式；legacy DOM 路径也走这里）
+  function isSysDanmaku(text) {
+    try { return isSystemDanmaku(text); } catch (_e) { return false; }
+  }
+  window.__lgjIsSystemDanmaku = function (text) { return isSysDanmaku(text); };
+  /** 结构型系统消息：节点/父节点类名含 system/notice/gift/welcome/enter 等 */
+  window.__lgjIsSystemNode = function (el) {
+    try {
+      if (!el) return false;
+      var cls = (el.className && typeof el.className === 'string') ? el.className.toLowerCase() : '';
+      var p = el.parentElement;
+      var pcls = (p && p.className && typeof p.className === 'string') ? p.className.toLowerCase() : '';
+      return /(system|notice|announce|welcome|gift|enter-msg|msg-system|barrage-system|chat-system|danmaku-system|--sys)/.test(cls + ' ' + pcls);
+    } catch (_e) { return false; }
+  };
+
+  // ---------------- B站协议采集源（自连，同源 fetch + wss） ----------------
+  function mixinKey(orig) {
+    var s = '';
+    for (var i = 0; i < MIXIN.length; i++) s += orig[MIXIN[i]];
+    return s.slice(0, 32);
+  }
+  function wbiSignQuery(params, imgKey, subKey) {
+    var mixin = mixinKey(imgKey + subKey);
+    var all = {}; for (var k in params) if (Object.prototype.hasOwnProperty.call(params, k)) all[k] = params[k];
+    all.wts = Math.floor(Date.now() / 1000);
+    var keys = Object.keys(all).sort();
+    var q = '';
+    for (var i = 0; i < keys.length; i++) { if (i) q += '&'; q += keys[i] + '=' + encodeURIComponent(all[keys[i]]); }
+    return q + '&w_rid=' + md5(q + mixin);
+  }
+  function safeTopHref() {
+    try { return (window.top && window.top.location && window.top.location.href) || ''; } catch (_e) { /* 跨域 */ }
+    try { return document.referrer || ''; } catch (_e2) { return ''; }
+  }
+  function __DEF_PROTECT___lgjResolveRoom() { return parseBiliRoomId(location.href, safeTopHref()); }
+  function __DEF_PROTECT___lgjProtoPlatform() { return location.hostname.indexOf('bilibili.com') >= 0 && __lgjResolveRoom() > 0; }
+  /** 多标签选举的 key：同房间的不同文档（含 blanc iframe）必须一致 */
+  function roomKey() { return __lgjResolveRoom() || location.pathname.replace(/[^0-9]/g, '') || location.hostname; }
+
+  function BiliSource(roomId, onDanmu, onDrop, onAuth) {
+    this.roomId = roomId;          // URL 里的房间号（可能是短号）
+    this.realRoomId = 0;           // 解析后的真实房间号
+    this.onDanmu = onDanmu;
+    this.onDrop = onDrop;
+    this.onAuth = onAuth;          // auth 成功瞬间回调（用于同步 domPause/engaged，避免丢首帧）
+    this.ws = null;
+    this.hb = null;
+    this.stopped = false;
+    this.alive = false;            // 只有 auth 成功后才为 true
+    this.lastMsgAt = 0;
+  }
+  BiliSource.prototype.stop = function () {
+    this.stopped = true;
+    this.alive = false;
+    if (this.hb) { clearInterval(this.hb); this.hb = null; }
+    if (this.ws) { try { this.ws.close(); } catch (_e) { /* 忽略 */ } this.ws = null; }
+  };
+  BiliSource.prototype.keyOf = function (url) { return url.split('/').pop().split('.')[0]; };
+  BiliSource.prototype.inflate = async function (buf, format) {
+    var ds = new DecompressionStream(format || 'deflate');
+    var stream = new Blob([buf]).stream().pipeThrough(ds);
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  };
+  BiliSource.prototype.start = function () {
+    var self = this;
+    // 1) 真实房间号（getInfoByRoom → room_init → 原值兜底）
+    return resolveRealRoomId(self.roomId).then(function (realRoom) {
+      if (self.stopped) throw new Error('stopped');
+      self.realRoomId = realRoom || self.roomId;
+      // 2) wbi keys + getDanmuInfo（用真实房号）
+      return httpJson('https://api.bilibili.com/x/web-interface/nav').then(function (nav) {
+        var img = nav.data && nav.data.wbi_img && nav.data.wbi_img.img_url;
+        var sub = nav.data && nav.data.wbi_img && nav.data.wbi_img.sub_url;
+        if (!img || !sub) throw new Error('nav-no-keys');
+        var q = wbiSignQuery({ id: self.realRoomId, type: 0 }, self.keyOf(img), self.keyOf(sub));
+        return httpJson('https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?' + q);
+      });
+    }).then(function (dm) {
+      if (self.stopped) return;
+      if (dm.code !== 0 || !dm.data || !dm.data.token) throw new Error('danmuinfo-' + dm.code);
+      var host = dm.data.host_list && dm.data.host_list[0];
+      if (!host) throw new Error('no-host');
+      return self.connect(host.host, host.wss_port || 2245, dm.data.token, readCookie('buvid3'));
+    }).catch(function (e) { self.stop(); throw e; });
+  };
+  BiliSource.prototype.connect = function (host, port, token, buvid) {
+    var self = this;
+    return new Promise(function (resolve, reject) {
+      var ws;
+      try { ws = new WebSocket('wss://' + host + ':' + port + '/sub'); } catch (e) { reject(e); return; }
+      ws.binaryType = 'arraybuffer';
+      var authOk = false;
+      var to = setTimeout(function () {
+        if (!authOk) { try { ws.close(); } catch (_e) { /* 忽略 */ } reject(new Error('auth-timeout')); }
+      }, 10000);
+      ws.onopen = function () {
+        self.ws = ws;
+        var body = JSON.stringify({ uid: 0, roomid: self.realRoomId || self.roomId, protover: 2, platform: 'web', type: 2, key: token, buvid: buvid });
+        try { ws.send(self.pkt(7, body)); } catch (e) { clearTimeout(to); reject(e); }
+      };
+      ws.onmessage = function (ev) {
+        if (!authOk) {
+          try {
+            var raw0 = new Uint8Array(ev.data);
+            if (raw0.length >= 16) {
+              var dv0 = new DataView(raw0.buffer, raw0.byteOffset, raw0.byteLength);
+              if (dv0.getUint32(8) === 8) {
+                var txt = new TextDecoder().decode(raw0.slice(dv0.getUint16(4), Math.min(dv0.getUint32(0), raw0.length)));
+                if (txt.indexOf('"code":0') >= 0) {
+                  authOk = true;
+                  self.alive = true;
+                  clearTimeout(to);
+                  self.hb = setInterval(function () {
+                    if (self.alive && self.ws && self.ws.readyState === 1) {
+                      try { self.ws.send(self.pkt(2, null)); } catch (_e) { /* 忽略 */ }
+                    }
+                  }, 30000);
+                  if (self.onAuth) { try { self.onAuth(); } catch (_e) { /* 忽略 */ } }
+                  resolve();
+                } else {
+                  clearTimeout(to);
+                  try { ws.close(); } catch (_e) { /* 忽略 */ }
+                  reject(new Error('auth-rejected'));
+                }
+              }
+            }
+          } catch (_e) { /* 忽略 */ }
+        } else {
+          self.handle(ev.data);
+        }
+      };
+      ws.onerror = function () {
+        if (!authOk) { clearTimeout(to); reject(new Error('ws-error')); }
+        else if (self.alive && typeof self.onDrop === 'function') self.onDrop();
+      };
+      ws.onclose = function () {
+        var wasActive = self.alive;
+        self.alive = false;
+        if (self.hb) { clearInterval(self.hb); self.hb = null; }
+        self.ws = null;
+        if (self.stopped) return;
+        // 只有 auth 成功过（真正接管过数据流）的掉线才触发回落；握手期失败由 start() reject 处理
+        if (wasActive && typeof self.onDrop === 'function') self.onDrop();
+      };
+    });
+  };
+  BiliSource.prototype.pkt = function (op, bodyStr) {
+    var b = bodyStr ? new TextEncoder().encode(bodyStr) : new Uint8Array(0);
+    var buf = new Uint8Array(16 + b.length);
+    var v = new DataView(buf.buffer);
+    v.setUint32(0, 16 + b.length); v.setUint16(4, 16); v.setUint16(6, 1); v.setUint32(8, op); v.setUint32(12, 1);
+    buf.set(b, 16);
+    return buf;
+  };
+  BiliSource.prototype.handle = async function (data) {
+    var self = this;
+    if (!self.alive || self.stopped) return;
+    try {
+      var raw = new Uint8Array(data);
+      if (raw.length < 16) return;
+      var dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+      var total = dv.getUint32(0), hlen = dv.getUint16(4), protover = dv.getUint16(6), op = dv.getUint32(8);
+      if (op !== 5) return;
+      var body = raw.slice(hlen, Math.min(total, raw.length));
+      var payload = body;
+      var framed = false;
+      if (protover === 2) { payload = await self.inflate(body, 'deflate'); framed = true; }
+      else if (protover === 3) {
+        // brotli（部分房间）；DecompressionStream('brotli') 不可用时直接放弃，由上层回落 DOM
+        payload = await self.inflate(body, 'brotli');
+        framed = true;
+      } else if (protover !== 0) return;
+      self.lastMsgAt = Date.now();
+      var off = 0;
+      var decoder = new TextDecoder();
+      while (framed && off + 16 <= payload.length) {
+        var pv = new DataView(payload.buffer, payload.byteOffset + off, payload.length - off);
+        var pt = pv.getUint32(0);
+        if (pt < 16 || off + pt > payload.length) break;
+        var ph = pv.getUint16(4);
+        self.consumeJson(decoder.decode(payload.slice(off + ph, off + pt)));
+        off += pt;
+      }
+      if (!framed) self.consumeJson(decoder.decode(payload));
+    } catch (_e) { /* 单帧忽略 */ }
+  };
+  /** 兼容 info[0][3]（秒）与 info[0][4]（毫秒）两种时间戳布局 */
+  function pickTsMs(info0) {
+    var vals = [];
+    if (Array.isArray(info0)) {
+      if (typeof info0[4] === 'number') vals.push(info0[4]);
+      if (typeof info0[3] === 'number') vals.push(info0[3]);
+    }
+    for (var i = 0; i < vals.length; i++) {
+      var v = vals[i];
+      if (v > 1e12) return v;       // 毫秒
+      if (v > 1e9) return v * 1000; // 秒
+    }
+    return Date.now();
+  }
+  BiliSource.prototype.consumeJson = function (txt) {
+    var self = this;
+    var t = txt.trim();
+    if (!t || (t.charCodeAt(0) !== 123 && t.charCodeAt(0) !== 91)) return;
+    var arr;
+    try { arr = JSON.parse(t); } catch (_e) { return; }
+    if (!Array.isArray(arr)) arr = [arr];
+    for (var i = 0; i < arr.length; i++) {
+      var m = arr[i];
+      if (!m || typeof m !== 'object' || String(m.cmd).split(':')[0] !== 'DANMU_MSG') continue;
+      var info = m.info;
+      if (!Array.isArray(info) || !info[1]) continue;
+      var text = String(info[1]);
+      if (!text) continue;
+      if (isSysDanmaku(text)) {
+        if (window.__lgjCountSystemFiltered) { try { window.__lgjCountSystemFiltered(text); } catch (_e) { /* 忽略 */ } }
+        continue;
+      }
+      var user = Array.isArray(info[2]) ? info[2] : [];
+      var uid = typeof user[0] === 'number' ? user[0] : null;
+      var nick = typeof user[1] === 'string' ? user[1] : '?';
+      var tsMs = pickTsMs(info[0]);
+      self.onDanmu(text, {
+        id: 'bl_' + (self.realRoomId || self.roomId) + '_' + tsMs + '_' + (uid || 0) + '_' + text.length,
+        uid: uid, nick: nick, ts: tsMs,
+      });
+    }
+  };
+
+  // ---------------- L1 原生发送（协议直发，默认关闭） ----------------
+  // 只做 B 站；返回 null 表示「不适用 / 未登录」→ 由 __lgjSend 回落 DOM。
+  // 平台明确拒绝或网络异常时绝不回落，避免「请求已到达但响应异常」时双发。
+  function protocolSend(text) {
+    if (!__lgjProtoPlatform()) return Promise.resolve(null);
+    var csrf = readCookie('bili_jct');
+    if (!csrf) return Promise.resolve(null);
+    var room = __lgjResolveRoom();
+    return resolveRealRoomId(room).then(function (realRoom) {
+      if (!realRoom) return null;
+      var body = 'bubble=0&msg=' + encodeURIComponent(text)
+        + '&color=16777215&mode=1&fontsize=25&rnd=' + Date.now()
+        + '&roomid=' + encodeURIComponent(realRoom)
+        + '&csrf=' + encodeURIComponent(csrf)
+        + '&csrf_token=' + encodeURIComponent(csrf)
+        + '&platform=web&web_location=444.8';
+      return httpJson('https://api.live.bilibili.com/msg/send', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          // 尽力模拟页面来源；GM_xmlhttpRequest 可能忽略受限头，fetch 由浏览器补
+          'Referer': 'https://live.bilibili.com/',
+          'Origin': 'https://live.bilibili.com',
+        },
+        data: body,
+      });
+    }).then(function (res) {
+      if (res === null) return null;
+      var m = mapBiliSendCode(res && res.code);
+      if (m.ok) return { success: true, errorCode: null, message: '协议发送成功' };
+      if (m.fallback) return null; // 未登录 / csrf 失效 → DOM 兜底
+      if (m.code === 'RATE_LIMITED') { try { window.__lgjSafety.trip(600000); } catch (_e) { /* 忽略 */ } }
+      // 明确失败：不回落 DOM（避免双发）；SEND_FAILED 在 legacy 中不重试
+      return { success: false, errorCode: 'SEND_FAILED', message: '协议发送失败: ' + m.code };
+    }).catch(function (e) {
+      return { success: false, errorCode: 'SEND_FAILED', message: '协议发送网络异常: ' + (e && e.message || e) };
+    });
+  }
+  window.__lgjSend = function (msg) {
+    if (sendMode !== 'protocol') return sender.send(msg);
+    return protocolSend(msg).then(function (r) {
+      if (r) return r;
+      return sender.send(msg); // 不适用 / 未登录 → DOM 兜底
+    }).catch(function (e) {
+      try { logError('__lgjSend', e); } catch (_e2) { /* 忽略 */ }
+      return { success: false, errorCode: 'SEND_FAILED', message: '协议发送异常' };
+    });
+  };
+
+
+
+  // ---------------- 引擎状态与 UI ----------------
+  var src = null;
+  var started = false;
+  var mode = 'auto';          // dom | protocol | auto
+  var sendMode = 'dom';
+  var engaged = false;        // 协议是否已 auth 成功并接管数据流
+  var protoFailUntil = 0;     // 协议失败/掉线后的退避再探时间
+  var autoUnavailable = false; // 智能模式是否不可用（一级界面显示手动开关）
+  var statusEl = null;
+  var selectEl = null;        // 设置页引擎开关（兼容旧引用）
+  var sendSelectEl = null;    // 设置页发送开关（兼容旧引用）
+  var election = null;
+  var electionChannel = null;
+  var metaMap = Object.create(null);
+  var seenMsgIds = Object.create(null);
+  var seenMsgOrder = [];
+  var logFilter = 'all';
+  var logSearch = '';
+
+  function setStatus(txt, cls) {
+    var color = cls === 'err' ? '#f66' : cls === 'ok' ? '#6c6' : '#aaa';
+    if (statusEl) { statusEl.textContent = txt; statusEl.style.color = color; }
+    var s = document.getElementById('s-engine-status');
+    if (s) { s.textContent = txt; s.style.color = color; }
+    var q = document.getElementById('lgj-engine-quick-status');
+    if (q && autoUnavailable) { q.textContent = txt.slice(0, 8); q.style.color = color; }
+  }
+
+  function feedProtocol(text, meta) {
+    if (!engaged || !text) return; // 互斥铁律：协议未接管绝不喂（P0-1）
+    if (meta && meta.id) {
+      if (seenMsgIds[meta.id]) return;
+      seenMsgIds[meta.id] = 1;
+      seenMsgOrder.push(meta.id);
+      if (seenMsgOrder.length > 2000) { var old = seenMsgOrder.shift(); delete seenMsgIds[old]; }
+    }
+    if (isSysDanmaku(text)) return;
+    addDanmuToCache(text);
+    recordMessageTimestamp();
+    if (meta) {
+      var rec = metaMap[text];
+      if (!rec) { rec = metaMap[text] = { count: 0, senders: Object.create(null), firstSeen: meta.ts || Date.now(), lastSeen: 0 }; }
+      rec.count++; rec.lastSeen = meta.ts || Date.now();
+      if (meta.uid !== null && meta.uid !== undefined) rec.senders[String(meta.uid)] = 1;
+      // 容量保护：超过 600 条时一次性裁剪到 500（避免每条新文本都排序）
+      if (!rec._bounded) {
+        rec._bounded = 1;
+        var keys = Object.keys(metaMap);
+        if (keys.length > 600) {
+          keys.sort(function (a, b) { return (metaMap[a].lastSeen || 0) - (metaMap[b].lastSeen || 0); });
+          for (var di = 0; di < keys.length - 500; di++) delete metaMap[keys[di]];
+        }
+      }
+    }
+  }
+
+  /**
+   * L2：协议结构化数据 → 候选权重乘子（DOM 模式无 meta，返回 1）。
+   * 综合「独立发送者数」「出现次数」「新鲜度」，上限 1.8，避免完全压过 legacy 频次模型。
+   */
+  window.__lgjMetaBoost = function (text) {
+    try {
+      var r = metaMap[text];
+      if (!r) return 1;
+      var senders = Object.keys(r.senders).length;
+      var age = Date.now() - (r.lastSeen || 0);
+      var recency = age < 30000 ? 1.2 : age < 120000 ? 1.0 : 0.8;
+      var boost = 1 + Math.min(0.5, senders / 20) + Math.min(0.3, (r.count || 0) / 50);
+      return Math.min(1.8, boost * recency);
+    } catch (_e) { return 1; }
+  };
+
+  // ---------------- 数据源互斥（P0-1） ----------------
+  /** 协议 auth 成功后才调用：暂停 DOM；不清空 freqMap，保持话题连续 */
+  function domPause() {
+    if (window.__lgjSourceKind === 'protocol') return;
+    window.__lgjSourceKind = 'protocol';
+    if (state.danmuObserver) {
+      try { state.danmuObserver.disconnect(); } catch (_e) { /* 忽略 */ }
+      state.danmuObserver = null;
+    }
+    logEvent('数据源', 'DOM → 协议（已暂停 DOM 采集）');
+  }
+  /** 协议停/掉线时恢复 DOM（仅机器人运行中；开关本身由 legacy toggle 负责） */
+  function domResume() {
+    if (window.__lgjSourceKind !== 'protocol') return;
+    window.__lgjSourceKind = 'dom';
+    if (state.standDown || !state.isRunning) return;
+    // 回落 DOM 时保留已采集的频次统计，避免协议掉线后候选池清零、需要 2 分钟重建
+    window.__lgjKeepStats = true;
+    try { ensureObserverRunning(); } catch (_e) { /* 忽略 */ }
+    finally { window.__lgjKeepStats = false; }
+    logEvent('数据源', '协议 → DOM（保留已采集统计）');
+  }
+  function stopProtocol() {
+    if (src) { try { src.stop(); } catch (_e) { /* 忽略 */ } src = null; }
+  }
+  /** 连接协议；auth 成功才 domPause + engaged，失败/掉线立即回 DOM（无数据空窗） */
+  function engageProto() {
+    if (__lgjEngaging) return Promise.resolve(false);
+    __lgjEngaging = true;
+    var room = __lgjResolveRoom();
+    if (!room || !__lgjProtoPlatform()) { __lgjEngaging = false; setStatus('协议：仅 B 站直播间可用', 'err'); return Promise.resolve(false); }
+    stopProtocol();
+    setStatus('协议：连接中…', '');
+    logEvent('协议', '连接中（房间 ' + room + '）');
+    src = new BiliSource(room, function (text, meta) {
+      feedProtocol(text, meta);
+    }, function () { onProtocolDrop(); }, function () {
+      // auth 成功瞬间同步接管，避免首帧被 engaged 守卫丢弃
+      domPause();
+      engaged = true;
+    });
+    return src.start().then(function () {
+      __lgjEngaging = false;
+      protoFailUntil = 0;
+      setStatus('协议：数据流', 'ok');
+      logEvent('协议', '已接管（真实房号 ' + ((src && src.realRoomId) || room) + '）');
+      return true;
+    }).catch(function (e) {
+      __lgjEngaging = false;
+      engaged = false;
+      stopProtocol();
+      domResume();
+      var reason = String((e && e.message) || e).slice(0, 24);
+      setStatus('协议不可用：' + reason, 'err');
+      logEvent('协议', '失败：' + reason + '，回落 DOM');
+      return false;
+    });
+  }
+  /** 协议掉线：立刻回 DOM，按模式退避后再探（不在 DOM 空窗里反复重连） */
+  function onProtocolDrop() {
+    engaged = false;
+    stopProtocol();
+    domResume();
+    if (mode === 'protocol') { setStatus('协议掉线→DOM（稍后重试）', 'err'); protoFailUntil = Date.now() + 8000; logEvent('协议', '掉线，回落 DOM（8s 后重试直连）'); }
+    else { setStatus('自动：协议掉线→DOM', 'err'); protoFailUntil = Date.now() + 30000; logEvent('协议', '掉线，回落 DOM（自动模式 30s 后再探）'); }
+  }
+  function disengageProto() {
+    if (!engaged && !src) return;
+    engaged = false;
+    stopProtocol();
+    domResume();
+  }
+  /** 非 leader 待机：停协议并断开 DOM，完全不采集（避免多标签重复监听） */
+  function standbySources() {
+    engaged = false;
+    stopProtocol();
+    window.__lgjSourceKind = 'dom';
+    if (state.danmuObserver) {
+      try { state.danmuObserver.disconnect(); } catch (_e) { /* 忽略 */ }
+      state.danmuObserver = null;
+    }
+  }
+  /** 单一生命周期：开关 / leader / 模式 / 退避都收敛到这里（2s 周期调用） */
+  function tick() {
+    if (!started) return;
+    var running = !!(state && state.isRunning);
+    // 计算「智能模式是否不可用」：非 B 站 / 探测失败退避中 → 一级界面显示手动开关
+    autoUnavailable = (mode === 'auto') && (!__lgjProtoPlatform() || Date.now() < protoFailUntil);
+    if (autoUnavailable && !_autoWarned) {
+      _autoWarned = true;
+      logEvent('引擎', '智能模式不可用（' + (!__lgjProtoPlatform() ? '该平台暂无协议源' : '协议探测失败/退避中') + '），一级界面已显示手动开关');
+    }
+    if (!autoUnavailable) _autoWarned = false;
+    refreshEngineControls();
+    // L4：非 leader 只待机，不启动数据源、不发送
+    if (election && !election.isLeader()) {
+      if (engaged || src) disengageProto();
+      setStatus('待机（其它标签页为发送者）', 'err');
+      return;
+    }
+    if (!running) {
+      if (engaged || src) disengageProto();
+      else if (mode !== 'dom' && __lgjProtoPlatform()) setStatus('待机：请打开机器人开关', '');
+      return;
+    }
+    if (mode === 'dom') {
+      if (engaged || src) disengageProto();
+      else if (state.isRunning && !state.danmuObserver) { try { ensureObserverRunning(); } catch (_e) { /* 忽略 */ } }
+      return;
+    }
+    if (engaged) return;
+    if (!__lgjProtoPlatform()) {
+      setStatus('DOM 采集（该平台暂无协议源）', 'ok');
+      protoFailUntil = Date.now() + 60000;
+      return;
+    }
+    if (Date.now() < protoFailUntil) return;
+    engageProto().then(function (ok) {
+      if (!ok && mode === 'auto') {
+        protoFailUntil = Date.now() + 60000;
+        setStatus('自动：DOM 采集（1 分钟后再探协议）', 'ok');
+      } else if (!ok) {
+        protoFailUntil = Date.now() + 15000;
+        setStatus('协议：不可用，已回落 DOM', 'err');
+      }
+    });
+  }
+  function applyMode() { tick(); } // 兼容旧调用名
+  function switchMode(m) {
+    if (m !== 'protocol' && m !== 'dom' && m !== 'auto') return;
+    var old = mode;
+    mode = m;
+    saveCfg({ mode: m });
+    if (m === 'dom' && (engaged || src)) disengageProto();
+    if (old !== m) logEvent('引擎', old + ' → ' + m);
+    refreshEngineControls();
+    tick();
+  }
+
+  /** 刷新一级界面引擎快捷开关 + 设置页引擎/发送控件 */
+  function refreshEngineControls() {
+    try {
+      var quick = document.getElementById('lgj-engine-quick');
+      var qInput = document.getElementById('lgj-engine-quick-toggle');
+      var qStatus = document.getElementById('lgj-engine-quick-status');
+      // 开关反映「当前实际数据源」：协议 / 智能且已接管 = 打开；其余 = 关闭（DOM）
+      var effProtocol = (mode === 'protocol') || (mode === 'auto' && engaged);
+      if (quick) quick.style.display = autoUnavailable ? 'flex' : 'none';
+      if (qInput) qInput.checked = effProtocol;
+      if (qStatus) qStatus.textContent = effProtocol ? '直连中' : 'DOM';
+      var sEng = document.getElementById('s-engineDirect');
+      if (sEng) { sEng.checked = effProtocol; sEng.disabled = false; }
+      var sSmart = document.getElementById('s-engineSmart');
+      if (sSmart) sSmart.textContent = mode === 'auto' ? '智能模式（当前）' : '切到智能模式';
+      var sStatus = document.getElementById('s-engine-status');
+      if (sStatus) sStatus.textContent = mode === 'protocol' ? '直连（协议）' : mode === 'dom' ? 'DOM 采集' : (autoUnavailable ? '智能不可用，请手动选择' : (engaged ? '智能：协议' : '智能：DOM'));
+      var sSend = document.getElementById('s-sendProtocol');
+      if (sSend) sSend.checked = (sendMode === 'protocol');
+    } catch (_e) { /* 忽略 */ }
+  }
+  function setSendMode(m) {
+    sendMode = m === 'protocol' ? 'protocol' : 'dom';
+    saveCfg({ sendMode: sendMode });
+    refreshEngineControls();
+  }
+
+  function buildUI() {
+    var content = document.getElementById('bot-panel-content');
+    if (!content) return false;
+    // 一级界面保持简洁：只在「智能模式不可用」时出现一个引擎直连开关
+    if (!document.getElementById('lgj-engine-quick')) {
+      var quick = document.createElement('div');
+      quick.id = 'lgj-engine-quick';
+      quick.style.cssText = 'display:none;align-items:center;gap:6px;margin:6px 0 2px;font-size:calc(var(--bot-font-size,12px) - 1px);color:var(--bot-text,#ccc);';
+      var qLabel = document.createElement('span');
+      qLabel.textContent = '直连引擎';
+      qLabel.style.cssText = 'flex:1;color:var(--bot-text,#aaa);';
+      var qSwitch = document.createElement('label');
+      qSwitch.className = 'bot-switch';
+      qSwitch.style.cssText = 'transform:scale(.85);transform-origin:center;';
+      var qInput = document.createElement('input');
+      qInput.type = 'checkbox'; qInput.id = 'lgj-engine-quick-toggle';
+      var qSlider = document.createElement('span'); qSlider.className = 'bot-slider';
+      qSwitch.appendChild(qInput); qSwitch.appendChild(qSlider);
+      var qStatus = document.createElement('span');
+      qStatus.id = 'lgj-engine-quick-status';
+      qStatus.style.cssText = 'color:#888;font-size:calc(var(--bot-font-size,12px) - 2px);min-width:44px;text-align:right;';
+      quick.appendChild(qLabel); quick.appendChild(qSwitch); quick.appendChild(qStatus);
+      content.appendChild(quick);
+      qInput.addEventListener('change', function () {
+        switchMode(qInput.checked ? 'protocol' : 'dom');
+      });
+    }
+    if (!document.getElementById('lgj-engine-status-main')) {
+      var st = document.createElement('div');
+      st.id = 'lgj-engine-status-main';
+      st.style.cssText = 'font-size:calc(var(--bot-font-size,12px) - 2px);color:#888;margin:2px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+      content.appendChild(st);
+    }
+    statusEl = document.getElementById('lgj-engine-status-main');
+    refreshEngineControls();
+    return true;
+  }
+
+  function buildExtraUI() {
+    var content = document.getElementById('bot-panel-content');
+    if (!content) return false;
+    if (!safety.ackConfirmed() && !document.getElementById('lgj-ack-row')) {
+      var ack = document.createElement('div');
+      ack.id = 'lgj-ack-row';
+      ack.style.cssText = 'margin:4px 0;padding:6px 8px;border:1px solid #f44336;border-radius:6px;font-size:calc(var(--bot-font-size,12px) - 1px);color:#f66;line-height:1.5;background:rgba(244,67,54,0.08);';
+      ack.innerHTML = '自动发送存在违反平台规则/封禁风险，仅用于有节制参与。<button id="lgj-ack-btn" style="margin-top:4px;background:#f44336;border:none;color:#fff;border-radius:4px;padding:3px 10px;cursor:pointer;">已知晓并启用</button>';
+      content.appendChild(ack);
+      var ackBtn = ack.querySelector('#lgj-ack-btn');
+      if (ackBtn) ackBtn.addEventListener('click', function () {
+        safety.confirmAck();
+        ack.remove();
+        applyMode();
+      });
+    }
+    return true;
+  }
+
+  function startConfigListener() {
+    try {
+      if (typeof GM_addValueChangeListener === 'function') {
+        GM_addValueChangeListener(STORAGE_KEYS.CONFIG_VERSION, function () {
+          try { checkConfigUpdate(); } catch (_e) { /* 忽略 */ }
+        });
+      }
+    } catch (_e) { /* 忽略 */ }
+    // 兜底：低频比对（替代 legacy 每秒轮询；listener 不可用时保底）
+    try {
+      setInterval(function () {
+        try {
+          var v = GM_getValue(STORAGE_KEYS.CONFIG_VERSION, 0);
+          if (v !== state.configVersion) checkConfigUpdate();
+        } catch (_e) { /* 忽略 */ }
+      }, 30000);
+    } catch (_e) { /* 忽略 */ }
+  }
+
+  function diagnose() {
+    var topMeta = [];
+    for (var k in metaMap) {
+      if (!Object.prototype.hasOwnProperty.call(metaMap, k)) continue;
+      var r = metaMap[k];
+      topMeta.push({ text: k.slice(0, 40), count: r.count, senders: Object.keys(r.senders).length, firstSeen: r.firstSeen, lastSeen: r.lastSeen });
+    }
+    topMeta.sort(function (a, b) { return b.count - a.count; });
+    return {
+      platform: _plat(), room: __lgjResolveRoom() || location.pathname.replace(/[^0-9]/g, ''),
+      engine: mode, sendMode: sendMode, engineStatus: statusEl ? statusEl.textContent : '',
+      sourceKind: window.__lgjSourceKind || '', engaged: engaged, protoFailUntil: protoFailUntil,
+      leader: election ? (election.isLeader() ? 'leader' : 'follower') : 'solo',
+      safety: { enabled: safety.getConfig().enabled, limits: safety.getConfig(), lastReason: safety.reason(), circuit: safety.circuitUntil > Date.now() },
+      configVersion: state.configVersion,
+      recentErrors: Logger.getRecentErrors(600000).slice(-5),
+      topProtocolMeta: topMeta.slice(0, 5),
+      lastLogs: Logger.getAll().slice(-10),
+    };
+  }
+
+  function exportConfig() {
+    var bundle = { __lgjExport: 1 };
+    try { bundle.config = GM_getValue(STORAGE_KEYS.CONFIG, null); } catch (_e) { bundle.config = null; }
+    try { bundle.theme = GM_getValue(STORAGE_KEYS.THEME, null); } catch (_e) { bundle.theme = null; }
+    try { bundle.blocklist = GM_getValue(STORAGE_KEYS.BLOCKLIST, []); } catch (_e) { bundle.blocklist = []; }
+    try { bundle.priority = GM_getValue(STORAGE_KEYS.PRIORITY, []); } catch (_e) { bundle.priority = []; }
+    try { bundle.filterRules = GM_getValue(STORAGE_KEYS.FILTER_RULES, []); } catch (_e) { bundle.filterRules = []; }
+    bundle.engine = loadCfg();
+    bundle.safety = safety.getConfig();
+    return bundle;
+  }
+  function importConfig(jsonStr) {
+    var obj;
+    try { obj = JSON.parse(jsonStr); } catch (_e) { return 'JSON 解析失败'; }
+    var err = validateConfigBundle(obj);
+    if (err) return '校验失败：' + err;
+    var applied = [];
+    if (obj.config && typeof obj.config === 'object') { GM_setValue(STORAGE_KEYS.CONFIG, obj.config); applied.push('配置'); }
+    if (obj.theme && typeof obj.theme === 'object') { GM_setValue(STORAGE_KEYS.THEME, obj.theme); applied.push('主题'); }
+    if (Array.isArray(obj.blocklist)) { GM_setValue(STORAGE_KEYS.BLOCKLIST, obj.blocklist); applied.push('屏蔽词'); }
+    if (Array.isArray(obj.priority)) { GM_setValue(STORAGE_KEYS.PRIORITY, obj.priority); applied.push('优先词'); }
+    if (Array.isArray(obj.filterRules)) { GM_setValue(STORAGE_KEYS.FILTER_RULES, obj.filterRules); applied.push('筛选规则'); }
+    if (obj.engine && typeof obj.engine === 'object') { saveCfg(obj.engine); applied.push('引擎'); }
+    if (obj.safety && typeof obj.safety === 'object') { safety.setConfig(obj.safety); applied.push('安全阀'); }
+    try { bumpConfigVersion(); } catch (_e) { /* 忽略 */ }
+    try { loadConfig(); applyTheme(state.config.theme); updateUIDisplay(getMessagesPerMinute()); } catch (_e) { /* 忽略 */ }
+    return '已导入：' + applied.join('、');
+  }
+
+  // ---------------- 设置页增强：引擎/发送/配置管理/日志筛选（二级界面） ----------------
+  function settingsSectionHtml(title, content) {
+    return '<div class="settings-section" style="background:var(--bot-border,rgba(255,255,255,0.03));border-radius:6px;padding:10px 12px;margin-bottom:12px;border:1px solid var(--bot-border,rgba(255,255,255,0.08));">'
+      + '<h3 style="font-size:calc(var(--bot-font-size,12px) + 1px);color:var(--bot-accent,#ff9800);margin:0 0 6px 0;">' + title + '</h3>'
+      + content + '</div>';
+  }
+  function settingsToggleRow(id, label, checked, hint) {
+    return '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
+      + '<label style="flex:1;color:var(--bot-text,#aaa);font-size:var(--bot-font-size,12px);">' + label + '</label>'
+      + '<input type="checkbox" id="' + id + '" ' + (checked ? 'checked' : '') + ' style="width:auto;">'
+      + '</div>'
+      + (hint ? '<div style="font-size:calc(var(--bot-font-size,12px) - 2px);color:#666;margin-top:2px;">' + hint + '</div>' : '');
+  }
+  function settingsBtnHtml(id, label) {
+    return '<button id="' + id + '" style="background:var(--bot-border,#2c2c3a);border:none;color:var(--bot-text,#ccc);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:calc(var(--bot-font-size,12px) - 1px);">' + label + '</button>';
+  }
+  /** 日志渲染：全部级别 + 级别筛选 + 搜索（覆盖 legacy 只显示 error 的实现） */
+  function renderLogsNow() {
+    try {
+      var container = document.querySelector('#settings-debug-list');
+      if (!container) return;
+      var items = Logger.getAll();
+      if (logFilter && logFilter !== 'all') items = items.filter(function (l) { return l.level === logFilter; });
+      if (logSearch) {
+        var q = String(logSearch).toLowerCase();
+        items = items.filter(function (l) { return String(l.content || '').toLowerCase().indexOf(q) >= 0; });
+      }
+      items = items.slice(-300);
+      var colors = { error: '#f44336', warn: '#ff9800', send: '#4caf50', event: '#2196f3', info: '#9e9e9e' };
+      var html = '';
+      for (var i = items.length - 1; i >= 0; i--) {
+        var l = items[i];
+        var color = colors[l.level] || '#9e9e9e';
+        html += '<div style="border-bottom:1px solid var(--bot-border,rgba(255,255,255,0.06));padding:3px 0;font-size:11px;word-break:break-all;">'
+          + '<span style="color:#888;">[' + escapeHtml(l.time || '') + ']</span> '
+          + '<span style="color:' + color + ';font-weight:bold;">' + escapeHtml(String(l.level || '').toUpperCase()) + '</span> '
+          + '<span style="color:var(--bot-text,#e0e0e0);">' + escapeHtml(String(l.content || '')) + '</span></div>';
+      }
+      container.innerHTML = html || '<div style="color:#666;padding:6px;">暂无日志</div>';
+      var badge = document.querySelector('#settings-debug-count');
+      if (badge) { badge.textContent = items.length; badge.style.display = items.length ? 'inline-block' : 'none'; }
+    } catch (_e) { /* 忽略 */ }
+  }
+  try { renderDebugLogs = renderLogsNow; } catch (_e) { /* 忽略 */ }
+  window.__lgjRenderLogs = renderLogsNow;
+
+  function doExportSettings(panel) {
+    try {
+      var txt = JSON.stringify(exportConfig());
+      if (typeof GM_setClipboard === 'function') { try { GM_setClipboard(txt); } catch (_e) { /* 忽略 */ } }
+      var area = panel && panel.querySelector('#settings-import-area');
+      if (area) { area.value = txt; area.style.display = 'block'; }
+      setStatus('已导出（复制或见文本框）', 'ok');
+    } catch (_e) { setStatus('导出失败', 'err'); }
+  }
+  function doImportSettings(panel) {
+    try {
+      var area = panel && panel.querySelector('#settings-import-area');
+      if (!area) return;
+      if (area.style.display === 'none') { area.style.display = 'block'; area.focus(); return; }
+      var msg = importConfig(area.value);
+      area.style.display = 'none';
+      setStatus(msg, msg.indexOf('已导入') === 0 ? 'ok' : 'err');
+      logEvent('配置', msg);
+      refreshEngineControls();
+    } catch (_e) { setStatus('导入失败', 'err'); }
+  }
+  window.__lgjEnhanceSettings = function (panel) {
+    try {
+      if (!panel) return;
+      var engineHtml = settingsSectionHtml('⚙️ 引擎',
+        settingsToggleRow('s-engineDirect', '直连引擎（协议）', mode === 'protocol', '关闭 = DOM 采集；打开 = 协议直连。默认 DOM。')
+        + '<div style="display:flex;align-items:center;gap:8px;margin-top:6px;">'
+        + settingsBtnHtml('s-engineSmart', '切到智能模式')
+        + '<span id="s-engine-status" style="font-size:calc(var(--bot-font-size,12px) - 2px);color:#888;"></span></div>');
+      var sendHtml = settingsSectionHtml('📤 发送',
+        settingsToggleRow('s-sendProtocol', '协议直发（实验）', sendMode === 'protocol', '关闭 = DOM 模拟（默认）；打开 = 调用 B 站发送接口。平台明确拒绝 / 网络异常不会回落，避免双发。'));
+      var configHtml = settingsSectionHtml('💾 配置管理',
+        '<div style="display:flex;gap:8px;margin-bottom:8px;">'
+        + settingsBtnHtml('settings-export-btn', '导出配置')
+        + settingsBtnHtml('settings-import-btn', '导入配置')
+        + settingsBtnHtml('settings-diag-btn', '诊断')
+        + '</div>'
+        + '<textarea id="settings-import-area" placeholder="粘贴导出的 JSON…" style="display:none;width:100%;height:70px;box-sizing:border-box;font-family:monospace;font-size:11px;background:var(--bot-border,#222);color:var(--bot-text,#ddd);border:1px solid #555;border-radius:4px;"></textarea>');
+      var firstSection = panel.querySelector('.settings-section');
+      if (firstSection) firstSection.insertAdjacentHTML('beforebegin', engineHtml + sendHtml + configHtml);
+      else panel.insertAdjacentHTML('beforeend', engineHtml + sendHtml + configHtml);
+
+      var list = panel.querySelector('#settings-debug-list');
+      if (list) {
+        var section = list.closest('.settings-section');
+        if (section) {
+          var h3 = section.querySelector('h3');
+          if (h3) h3.textContent = '📋 日志';
+          var filterLabels = [['all', '全部'], ['event', '事件'], ['send', '发送'], ['warn', '警告'], ['error', '错误'], ['info', '信息']];
+          var filters = '<div id="lgj-log-filters" style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;">';
+          for (var fi = 0; fi < filterLabels.length; fi++) {
+            var active = filterLabels[fi][0] === logFilter ? ';background:var(--bot-accent,#ff9800);color:var(--bot-bg,#1a1a2e);' : '';
+            filters += '<button data-log-filter="' + filterLabels[fi][0] + '" style="background:var(--bot-border,#2c2c3a);border:none;color:var(--bot-text,#ccc);padding:2px 8px;border-radius:10px;cursor:pointer;font-size:calc(var(--bot-font-size,12px) - 2px)' + active + '">' + filterLabels[fi][1] + '</button>';
+          }
+          filters += '</div>'
+            + '<div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">'
+            + '<input id="settings-log-search" placeholder="搜索日志…" style="flex:1;background:var(--bot-border,rgba(255,255,255,0.06));border:1px solid var(--bot-border,rgba(255,255,255,0.12));color:var(--bot-text,#eee);border-radius:4px;padding:3px 6px;font-size:calc(var(--bot-font-size,12px) - 1px);">'
+            + '<label style="font-size:calc(var(--bot-font-size,12px) - 2px);color:#888;white-space:nowrap;"><input type="checkbox" id="settings-log-verbose" style="width:auto;">详细</label>'
+            + '</div>';
+          var clearBtn = section.querySelector('#settings-debug-clear');
+          if (clearBtn) clearBtn.insertAdjacentHTML('beforebegin', filters);
+          else section.insertAdjacentHTML('afterbegin', filters);
+          var divs = section.querySelectorAll('div');
+          for (var hi = 0; hi < divs.length; hi++) {
+            if (String(divs[hi].textContent).indexOf('仅显示错误') >= 0) {
+              divs[hi].textContent = '显示最近 300 条；「事件」含引擎/协议/安全阀/选择等。';
+              break;
+            }
+          }
+        }
+      }
+
+      var eng = panel.querySelector('#s-engineDirect');
+      if (eng) eng.addEventListener('change', function () { switchMode(eng.checked ? 'protocol' : 'dom'); });
+      var smart = panel.querySelector('#s-engineSmart');
+      if (smart) smart.addEventListener('click', function () { switchMode('auto'); });
+      var send = panel.querySelector('#s-sendProtocol');
+      if (send) send.addEventListener('change', function () {
+        if (send.checked) {
+          var ok = true;
+          try { ok = window.confirm('协议直发为实验功能：直接调用 B 站发送接口，可能触发风控，且需要登录态。是否启用？'); } catch (_e) { ok = true; }
+          if (!ok) { send.checked = false; return; }
+          setSendMode('protocol');
+        } else { setSendMode('dom'); }
+        logEvent('发送', send.checked ? '切换：协议直发（实验）' : '切换：DOM 模拟');
+      });
+      var exp = panel.querySelector('#settings-export-btn');
+      if (exp) exp.addEventListener('click', function () { doExportSettings(panel); });
+      var imp = panel.querySelector('#settings-import-btn');
+      if (imp) imp.addEventListener('click', function () { doImportSettings(panel); });
+      var diag = panel.querySelector('#settings-diag-btn');
+      if (diag) diag.addEventListener('click', function () {
+        try { console.log('[烂梗机诊断]', JSON.stringify(diagnose(), null, 2)); } catch (_e) { /* 忽略 */ }
+        setStatus('诊断已输出到控制台(F12)', 'ok');
+      });
+      var filterBtns = panel.querySelectorAll('[data-log-filter]');
+      for (var bi = 0; bi < filterBtns.length; bi++) {
+        filterBtns[bi].addEventListener('click', function () {
+          logFilter = this.getAttribute('data-log-filter') || 'all';
+          var all = panel.querySelectorAll('[data-log-filter]');
+          for (var aj = 0; aj < all.length; aj++) {
+            if (all[aj] === this) { all[aj].style.background = 'var(--bot-accent,#ff9800)'; all[aj].style.color = 'var(--bot-bg,#1a1a2e)'; }
+            else { all[aj].style.background = 'var(--bot-border,#2c2c3a)'; all[aj].style.color = 'var(--bot-text,#ccc)'; }
+          }
+          renderLogsNow();
+        });
+      }
+      var search = panel.querySelector('#settings-log-search');
+      if (search) search.addEventListener('input', function () { logSearch = search.value.trim(); renderLogsNow(); });
+      var verbose = panel.querySelector('#settings-log-verbose');
+      if (verbose) {
+        verbose.checked = !!Logger._debug;
+        verbose.addEventListener('change', function () { Logger.setDebug(verbose.checked); });
+      }
+
+      refreshEngineControls();
+      renderLogsNow();
+    } catch (_e) { /* 忽略 */ }
+  };
+
+
+  // ---------------- L4：多标签 leader 选举（唯一发送者） ----------------
+  function startCrossTabWatch() {
+    try {
+      var room = roomKey();
+      var bc = null;
+      if (typeof BroadcastChannel === 'function') {
+        try { bc = new BroadcastChannel('lgj120_' + _plat() + '_' + room); } catch (_e) { bc = null; }
+      }
+      electionChannel = bc;
+      election = new LeaderElection({
+        storage: safetyStore,
+        key: 'LGJ_LEADER_' + _plat() + '_' + room,
+        onChange: function (isLeader) {
+          if (isLeader) {
+            if (started) tick();
+            else setStatus('启动中…', '');
+          } else {
+            setStatus('待机（其它标签页为发送者）', 'err');
+            standbySources();
+          }
+        },
+        post: bc ? function (m) { try { bc.postMessage(m); } catch (_e) { /* 忽略 */ } } : null,
+      });
+      if (bc) {
+        bc.onmessage = function (ev) {
+          var d = ev.data;
+          if (d && (d.t === 'hb' || d.t === 'leader')) {
+            try { election.onMessage(d); } catch (_e) { /* 忽略 */ }
+          }
+        };
+      }
+      election.start();
+    } catch (_e) { /* 忽略 */ }
+  }
+
+  /** 面板被 SPA 重建后重挂注入 UI；让位后停协议并释放 leader 租约（P1-8） */
+  function ensureHybridUI() {
+    if (state.standDown) {
+      if (window.__lgjEngineOnStandDown) window.__lgjEngineOnStandDown();
+      return;
+    }
+    if (!document.getElementById('bot-panel')) return;
+    buildUI();
+    buildExtraUI();
+    tick();
+  }
+
+  function boot() {
+    restoreRingLog();
+    hookRingLog();
+    startConfigListener();
+    var c = loadCfg();
+    mode = (c.mode === 'protocol' || c.mode === 'dom') ? c.mode : 'auto';
+    sendMode = c.sendMode === 'protocol' ? 'protocol' : 'dom';
+    started = true;
+    // leader 选举首次 tick 会通过 onChange 触发 leader 的 tick()，follower 保持待机
+    startCrossTabWatch();
+    // 常驻 watchdog：面板被 SPA 重建后重挂 UI，同时驱动数据源生命周期
+    setInterval(ensureHybridUI, 2000);
+    // 60s 采集摘要：DPM/候选/freq/系统过滤/来源/模式，让日志有内容
+    setInterval(logPeriodicSummary, 60000);
+    ensureHybridUI();
+  }
+
+  // 桥：协议文本 → legacy 引擎（带 id 去重；meta 用于诊断/后续 L2）
+  window.__lgjFeed = function (text, meta) {
+    try { feedProtocol(text, meta); } catch (_e) { /* 忽略 */ }
+  };
+  window.__lgjEngine = {
+    switchMode: function (m) { switchMode(m); },
+    setSendMode: function (m) { setSendMode(m); },
+    apply: function () { tick(); },
+    stop: function () { disengageProto(); },
+    diagnose: function () { return diagnose(); },
+  };
+  window.__lgjEngineOnStart = function () { tick(); };
+  window.__lgjEngineOnStop = function () { disengageProto(); };
+  window.__lgjIsLeader = function () { return election ? election.isLeader() : true; };
+  // B 站 blanc 让位：必须停选举并释放租约，否则主文档会一直占着 leader 让 iframe 实例待机
+  window.__lgjEngineOnStandDown = function () {
+    engaged = false;
+    stopProtocol();
+    if (election) { try { election.stop(); } catch (_e) { /* 忽略 */ } }
+    try { safetyStore.set('LGJ_LEADER_' + _plat() + '_' + roomKey(), { tabId: '', expiresAt: 0 }); } catch (_e2) { /* 忽略 */ }
+  };
+  window.__lgjSourceKind = 'dom';
+
+
+    // ============ 1.2.0-P2 平台协议扩展 + UI 增强（追加于生产 hybrid IIFE 内）============
+    // 与生产 hybrid 同作用域：复用 mode/engaged/feedProtocol/onProtocolDrop/domPause/
+    // isBiliPage/biliRoom/state/safety 等符号。
+    // 平台协议能力（2026-09-09 真机校准后收敛）：
+    //   B站：自连 comet wss —— 保留（真机验证可用）
+    //   斗鱼：danmuproxy 帧级实现 auth-timeout（真机不可用）→ 禁用，走 DOM
+    //   虎牙：需 ws.Launch 会话（真机遗留未闭环）→ DOM
+    //   抖音：im 签名仅页面 SDK 可产（沙箱不可行）→ DOM
+    // 任何失败/不可用平台均由 engageProto catch 回落 DOM（安全兜底）。
+  
+    function __lgjHost() {
+      try {
+        var h = location.hostname;
+        if (h.indexOf('douyu.com') >= 0) return 'douyu';
+        if (h.indexOf('huya.com') >= 0) return 'huya';
+        if (h.indexOf('bilibili.com') >= 0) return 'bilibili';
+        if (h.indexOf('douyin.com') >= 0) return 'douyin';
+      } catch (_e) { /* 忽略 */ }
+      return '';
+    }
+    function __lgjIsBili() { try { return isBiliPage(); } catch (_e) { return false; } }
+    /** 该平台是否有沙箱可直连的协议源（斗鱼帧级实现真机 auth-timeout 已下线；虎牙/抖音需页面 hook） */
+    var __lgjEngaging = false; // engage 进行中互斥锁（防每 2s 重复并发连协议）
+    function __lgjProtoPlatform() {
+      var h = __lgjHost();
+      return h === 'bilibili';
+    }
+    function __lgjPlatformName() {
+      var names = { bilibili: 'B站', douyu: '斗鱼', huya: '虎牙', douyin: '抖音' };
+      return names[__lgjHost()] || __lgjHost() || '未知';
+    }
+    function __lgjResolveRoom() {
+      if (__lgjIsBili()) { try { return biliRoom() || 0; } catch (_e) { return 0; } }
+      try {
+        var m = /^\/(\d+)/.exec(location.pathname);
+        if (m) return parseInt(m[1], 10);
+        m = /[?&]rid=(\d+)/.exec(location.search);
+        if (m) return parseInt(m[1], 10);
+      } catch (_e) { /* 忽略 */ }
+      return 0;
+    }
+    function __lgjBuildSource(room, onDanmu, onDrop, onAuth) {
+      var h = __lgjHost();
+      if (h === 'bilibili') return new BiliSource(room, onDanmu, onDrop, onAuth);
+      if (h === 'douyu') return new DouyuSource(room, onDanmu, onDrop, onAuth);
+      var err = new Error('该平台暂无沙箱协议源（' + __lgjPlatformName() + '）');
+      return { start: function () { return Promise.reject(err); }, stop: function () { /* 忽略 */ } };
+    }
+  
+    // ---------------- 斗鱼协议源（真机协议验证：docs/斗鱼协议采集-全量测试.md） ----------------
+    function DouyuSource(roomId, onDanmu, onDrop, onAuth) {
+      this.roomId = roomId;
+      this.onDanmu = onDanmu;
+      this.onDrop = onDrop;
+      this.onAuth = onAuth;
+      this.ws = null;
+      this.hb = null;
+      this.stopped = false;
+      this.alive = false;
+    }
+    DouyuSource.prototype.stop = function () {
+      this.stopped = true; this.alive = false;
+      if (this.hb) { clearInterval(this.hb); this.hb = null; }
+      if (this.ws) { try { this.ws.close(); } catch (_e) { /* 忽略 */ } this.ws = null; }
+    };
+    DouyuSource.prototype._frame = function (typeStr) {
+      var enc = new TextEncoder().encode(typeStr + '\x00');
+      var len = 8 + enc.length;          // len = 双 u32 + type + body（含 \0）
+      var buf = new Uint8Array(4 + len);
+      var v = new DataView(buf.buffer);
+      v.setUint32(0, len, true);
+      v.setUint32(4, len, true);
+      v.setUint32(8, 0x02b1, true);      // 客户端 → 服务器
+      buf.set(enc, 12);
+      return buf;
+    };
+    DouyuSource.prototype.start = function () {
+      var self = this;
+      var hosts = [8501, 8502, 8503, 8504, 8505, 8506];
+      var lastErr = null;
+      var attempt = function (i) {
+        if (self.stopped) return Promise.reject(new Error('stopped'));
+        return new Promise(function (resolve, reject) {
+          var ws;
+          try { ws = new WebSocket('wss://danmuproxy.douyu.com:' + hosts[i] + '/'); } catch (e) { reject(e); return; }
+          ws.binaryType = 'arraybuffer';
+          var opened = false;
+          var loginResolve = resolve;
+          var to = setTimeout(function () { if (!opened) { try { ws.close(); } catch (_e) { /* 忽略 */ } reject(new Error('open-timeout')); } }, 6000);
+          ws.onopen = function () {
+            opened = true;
+            self.ws = ws;
+            self.alive = true;
+            var rid = self.roomId;
+            var login = 'type@=loginreq/roomid@=' + rid
+              + '/dfl@=sn@AA=106@ASss@AA=1@Ssn@AA=107@ASss@AA=1@Ssn@AA=108@ASss@AA=1@Ssn@AA=105@ASss@AA=1'
+              + '/username@=visitor' + String(Math.floor(Math.random() * 900000000) + 100000000)
+              + '/uid@=' + String(Math.floor(Math.random() * 9000000000) + 1000000000)
+              + '/ver@=20220825/aver@=218101901/ct@=0/';
+            try { ws.send(self._frame(login)); } catch (_e) { /* 忽略 */ }
+            // 斗鱼对缺 loginreq/坏 room 不主动断开 → 客户端 5s 登录超时判定
+            setTimeout(function () {
+              if (!self.stopped && !self.alive) return;
+              if (!loginResolve) return;
+              loginResolve(false); // 超时仍 resolve(false)，由上层按失败处理
+            }, 5000);
+          };
+          ws.onmessage = function (ev) { self._handle(ev.data, loginResolve, ws); };
+          ws.onerror = function () { clearTimeout(to); if (!opened) reject(new Error('ws-error')); };
+          ws.onclose = function () {
+            var wasActive = self.alive;
+            self.alive = false;
+            if (self.hb) { clearInterval(self.hb); self.hb = null; }
+            if (self.stopped) return;
+            if (wasActive && self.onDrop) self.onDrop();
+          };
+        }).catch(function (e) {
+          lastErr = e;
+          if (i < hosts.length - 1) return attempt(i + 1);
+          return Promise.reject(lastErr);
+        });
+      };
+      return attempt(0).then(function (ok) {
+        if (!ok || self.stopped) { if (self.ws) { try { self.ws.close(); } catch (_e) { /* 忽略 */ } } throw new Error('douyu-login-timeout'); }
+        try { self.ws.send(self._frame('joingroup/rid@=' + self.roomId + '/gid@=1/')); } catch (_e) { /* 忽略 */ }
+        self.hb = setInterval(function () {
+          if (self.alive && self.ws && self.ws.readyState === 1) {
+            try { self.ws.send(self._frame('mrkl/')); } catch (_e) { /* 忽略 */ }
+          }
+        }, 40000);
+        if (self.onAuth) { try { self.onAuth(); } catch (_e) { /* 忽略 */ } }
+      });
+    };
+    DouyuSource.prototype._handle = function (data, loginResolve, wsRef) {
+      var self = this;
+      if (self.stopped) return;
+      var now = Date.now();
+      try {
+        var raw = new Uint8Array(data);
+        var dec = new TextDecoder();
+        var off = 0;
+        while (off + 12 <= raw.length) {
+          var dv = new DataView(raw.buffer, raw.byteOffset + off, raw.length - off);
+          var lenA = dv.getUint32(0, true);
+          var lenB = dv.getUint32(4, true);
+          var type = dv.getUint32(8, true);
+          if (lenA < 9 || lenA > 65536 || lenA !== lenB) break;
+          var msgEnd = off + 4 + lenA;
+          if (msgEnd > raw.length) break;
+          var bodyBytes = raw.slice(off + 12, msgEnd);
+          var end = bodyBytes.length;
+          for (var zi = 0; zi < bodyBytes.length; zi++) { if (bodyBytes[zi] === 0) { end = zi; break; } }
+          var text = dec.decode(bodyBytes.subarray(0, end));
+          if (type === 0x02b2 && text) self._consume(text, loginResolve, now);
+          off = msgEnd;
+        }
+      } catch (_e) { /* 单帧容错 */ }
+    };
+    DouyuSource.prototype._consume = function (text, loginResolve, now) {
+      var self = this;
+      var type = '';
+      var kv = {};
+      var parts = text.split('/');
+      for (var i = 0; i < parts.length; i++) {
+        var seg = parts[i];
+        if (!seg) continue;
+        var eq = seg.indexOf('@=');
+        if (eq < 0) continue;
+        var k = seg.slice(0, eq);
+        var val = seg.slice(eq + 2);
+        if (k === 'type') type = val;
+        else kv[k] = val;
+      }
+      if (type === 'loginres') {
+        if (loginResolve) { loginResolve(true); loginResolve = null; } // 匿名负 userid 也成功
+        return;
+      }
+      if (type === 'chatmsg' && kv.txt) {
+        var uid = kv.uid !== undefined ? kv.uid : null;
+        self.onDanmu(String(kv.txt), { id: String(uid) + ':' + String(kv.txt).length, uid: uid, nick: String(kv.nn || '?'), ts: now });
+      }
+    }
+  
+  setTimeout(boot, 1500);
+})();
+
+// ===== Hybrid 注入结束 =====
+
     setTimeout(init, 3000);
 })();

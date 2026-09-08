@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         烂梗机
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.2.1
 // @description  多平台自动复读弹幕 | DOM+协议双引擎 | 智能去重 | L3 安全阀
 // @match        https://www.douyu.com/*
 // @match        https://www.huya.com/*
@@ -165,7 +165,7 @@
     // 防重标记带版本号：检测到其他版本已运行（多版本共存）时醒目告警。
     // 注意：1.1.12 及更早版本不设置此标记，无法拦截，升级前务必删除旧版脚本，
     // 否则同页面多实例并发发送（README/发布说明中需强调）。
-    const INSTALLED_VERSION = '1.2.0';
+    const INSTALLED_VERSION = '1.2.1';
     if (document.documentElement) {
         const marker = document.documentElement.getAttribute('data-lgj-loaded');
         if (marker) {

@@ -1,9 +1,0 @@
-{
-  "owner": "",
-  "repo": "",
-  "homepage": "https://github.com/{owner}/{repo}",
-  "updateURL": "https://github.com/{owner}/{repo}/releases/latest/download/latest.user.js",
-  "downloadURL": "https://github.com/{owner}/{repo}/releases/latest/download/latest.user.js",
-  "author": "LaGenJi contributors",
-  "license": "MIT"
-}
