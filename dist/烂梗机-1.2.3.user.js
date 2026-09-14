@@ -3119,7 +3119,21 @@ ${buildDebugSection()}
     // 因此要求紧跟金额/数量/礼物名词，不能只凭「打赏了」三字。
     /(送出了|赠送了|投喂了|打赏了|开通了|续费了)[^，。！？]{0,10}(火箭|飞机|礼物|舰长|提督|总督|礼物榜|元|币|个|份|×|\d)/,
     /(加入了粉丝团|加入粉丝团|粉丝团|粉丝牌|点亮了|勋章|大航海|舰长|提督|总督|守护)/,
-    /^.{1,16}(进入了直播间|来到了直播间|进入直播间|离开了直播间)$/,
+    /^.{1,16}(进入了直播间|来到了直播间|进入直播间|进直播间了|离开了直播间)$/,
+    // 1.2.3：抖音进场消息（真机实测 2026-09-14）。
+    // 抖音把进场提示渲染成独立条目「<昵称> 来了」/「<昵称>等<N>人来」，文本干净、
+    // 长度正常、无任何系统关键词 → 原过滤全部漏过，真机实测已被选为「下次发送」。
+    //
+    // 误杀风险与判据设计（这是本条最需要小心的地方）：
+    //   · 「我来了」「他来了」这类**是玩家弹幕**，不能过滤 → 标准「等N人来」变体单独成条，
+    //     它带人数量词，正常弹幕几乎不会这样写；
+    //   · 无「等N人」时，要求昵称段**至少 2 字符且不是单一人称/指示代词开头**
+    //     （我/你/他/她/它/咱/俺/这/那/又/才/刚/快/就/可/真/原来…）——真机进场昵称都是
+    //     2 字符以上的用户 ID（`FourMinuteMile` / `有馬佳奈`），日常弹幕则是短口语。
+    //   · 含冒号的是「昵称：内容」格式的真弹幕（真机样例
+    //     「别逗笑Eternal.：@我真的没有学」），用负向先行断言排除。
+    /^(?![我你他她它咱俺这那又才刚快就可真原来][^，。！？、\n]{0,26}(了|来))[^，。！？、\n：:]{2,28}(等\d{1,4}人)?来了$/,
+    /^[^，。！？、\n：:]{1,28}等\d{1,4}人来$/,
     /^(恭喜.{0,8}(中奖|获奖|获得|抽中)|中奖|获奖|抽奖|打卡|签到|领取)/,
     /(禁言|封禁|违规|警告|举报|管理员|房管|超管)/,
     // 1.2.3：平台合规/风控宣导文案（真机实测虎牙把「禁止未成年人直播及消费」渲染进弹幕区，
@@ -4441,13 +4455,38 @@ ${buildDebugSection()}
       // 顺序关键：`.msg-bubble` 判定必须在最前，避免任何结构判据把真弹幕一起收走。
       // 仅虎牙启用（其它平台的包裹层结构与类名不同，多查一次只会白付开销）；
       // 性能：真弹幕走第 1 次 querySelector 即 return（热路径 1 次/条）；其余 2 次。
-      if (_plat() !== 'huya') return false;
-      try {
-        if (el.querySelector) {
-          if (el.querySelector('.msg-bubble')) return false;
-          if (el.querySelector('.tit-h-send,.send-gift,[class*="box-noble-level"],[class*="msg-pic--"]')) return true;
-        }
-      } catch (_e3) { /* 忽略 */ }
+      if (_plat() === 'huya') {
+        try {
+          if (el.querySelector) {
+            if (el.querySelector('.msg-bubble')) return false;
+            if (el.querySelector('.tit-h-send,.send-gift,[class*="box-noble-level"],[class*="msg-pic--"]')) return true;
+          }
+        } catch (_e3) { /* 忽略 */ }
+        return false;
+      }
+      // 1.2.3 真机修复（抖音）：进场提示「<昵称> 来了」/「<昵称>等<N>人来」与平台合规宣导
+      // 都渲染在 `.webcast-chatroom___item` 里，但它们**没有**真弹幕的文本节点
+      // `.webcast-chatroom___content-with-emoji-text`；而 legacy 的 danmuText 选择器
+      // 从中抽不到文本 → 回退整条 textContent → 进场文案入池（真机实测已被选为「下次发送」）。
+      //
+      // 判据分两层，**刻意做成 fail-safe**：
+      //   1) 有真弹幕文本节点 → 直接放行（不做任何文本判断）；
+      //   2) 没有该节点时，**不**一律判系统，而是仅在文本也**明确像进场/系统**时才判系统。
+      //      理由：若页面改名了 `content-with-emoji-text`，「一律判系统」会把**全部弹幕**
+      //      误杀（比漏过滤更严重）；而绝大多数真弹幕文本不会以「来了」结尾、也不以
+      //      系统前缀开头，因此这一层的误杀面极小。
+      if (_plat() === 'douyin') {
+        try {
+          if (el.querySelector) {
+            if (el.querySelector('.webcast-chatroom___content-with-emoji-text')) return false;
+            var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!t) return true;
+            if (/(等\d{1,4}人)?来了$/.test(t)) return true;
+            if (/^(欢迎来到|系统消息|系统公告|温馨提示|直播间公告)/.test(t)) return true;
+          }
+        } catch (_e4) { /* 忽略 */ }
+        return false;
+      }
       return false;
     } catch (_e) { return false; }
   };
@@ -4526,6 +4565,20 @@ ${buildDebugSection()}
     }).then(function (dm) {
       // 1.2.2：中止必须 reject——return 会让 engageProto 把「已被 stop」误判为连接成功
       if (self.stopped) throw new Error('stopped');
+      /**
+       * getDanmuInfo 失败的原因要**可读**（1.2.3 真机补）。
+       *
+       * 真机观察（2026-09-14，B 站 261095，已登录）：`getDanmuInfo` **间歇性**返回
+       * `code=-352`。在页面里手工复现时，**不带任何签名/参数**的裸请求同样返回 `-352`
+       * （而同页 `nav` / `room_init` 均 `code=0`），说明 `-352` 是**平台侧**对弹幕服务器
+       * 接入的风控拒绝，不是本脚本 WBI 实现的缺陷——但这条对照实验**不足以**排除签名问题：
+       * 脚本自身也曾走到 `auth-timeout`（即已拿到 token、卡在 wss 握手），
+       * 说明两条失败路径都会出现，取决于当时的平台状态。
+       *
+       * 因此这里只做「如实标注原因」：把 -352 与其它错误码区分开，便于用户/日志判断
+       * 是「换 IP/登录态可解」的风控，还是脚本侧的协议问题。不重试、不换凭据。
+       */
+      if (dm.code === -352) throw new Error('danmuinfo-风控拒绝(-352)');
       if (dm.code !== 0 || !dm.data || !dm.data.token) throw new Error('danmuinfo-' + dm.code);
       var host = dm.data.host_list && dm.data.host_list[0];
       if (!host) throw new Error('no-host');
